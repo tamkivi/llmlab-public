@@ -1,5 +1,6 @@
 {
-  "name": "fart_picker",
+  "name": "llmlab-public",
+  "description": "Public snapshot of LLMLab.ee, an AI-focused PC build configurator for Estonian market pricing.",
   "version": "0.1.0",
   "private": true,
   "scripts": {

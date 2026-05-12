@@ -49,7 +49,7 @@ npm run build            # Production build
 npm run pricing:refresh  # Run pricing refresh without starting Next dev server
 ```
 
-Tests use `FART_PICKER_DATA_DIR` to create an isolated temporary SQLite database, so they should not mutate `data/catalog.db`.
+Tests use `LLMLAB_DATA_DIR` to create an isolated temporary SQLite database, so they should not mutate `data/catalog.db`.
 
 ## Environment Variables
 
@@ -60,7 +60,7 @@ Tests use `FART_PICKER_DATA_DIR` to create an isolated temporary SQLite database
 | `ADMIN_API_TOKEN` | ops optional | Bearer token for operational admin endpoints such as `/api/db/audit`; keep separate from `CRON_SECRET`. |
 | `DATABASE_URL` / `POSTGRES_URL` | prod | PostgreSQL connection string. Hosted deployments fail closed without this unless `ALLOW_EPHEMERAL_SQLITE=true` is explicitly set. |
 | `ALLOW_EPHEMERAL_SQLITE` | preview escape hatch | Allows hosted SQLite fallback only when explicitly set to `true`; do not use for production commerce. |
-| `FART_PICKER_DATA_DIR` | tests/local override | Directory for SQLite `catalog.db`. Used by tests. |
+| `LLMLAB_DATA_DIR` | tests/local override | Directory for SQLite `catalog.db`. Used by tests. |
 | `STRIPE_SECRET_KEY` | payments | Stripe API key for checkout session creation. |
 | `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` / `STRIPE_PUBLISHABLE_KEY` | payments | Stripe publishable key used for live/test mode consistency checks. |
 | `STRIPE_WEBHOOK_SECRET` | payments | Stripe webhook signature verification secret. |

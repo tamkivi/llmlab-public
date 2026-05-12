@@ -341,8 +341,8 @@ async function captureConsoleOutput(
 }
 
 before(async () => {
-  dataDir = mkdtempSync(join(tmpdir(), "fart-picker-test-"));
-  process.env.FART_PICKER_DATA_DIR = dataDir;
+  dataDir = mkdtempSync(join(tmpdir(), "llmlab-test-"));
+  process.env.LLMLAB_DATA_DIR = dataDir;
   delete process.env.DATABASE_URL;
   delete process.env.POSTGRES_URL;
 
@@ -358,7 +358,7 @@ before(async () => {
 after(async () => {
   await db?.getAdapter().close();
   if (dataDir) rmSync(dataDir, { recursive: true, force: true });
-  delete process.env.FART_PICKER_DATA_DIR;
+  delete process.env.LLMLAB_DATA_DIR;
 });
 
 test("insertPriceHistory upserts one row per item per recorded date", async () => {

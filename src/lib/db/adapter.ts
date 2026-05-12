@@ -41,8 +41,8 @@ export function resolveDatabaseDialect(env: NodeJS.ProcessEnv = process.env): Db
 }
 
 function resolveDataDir(env: NodeJS.ProcessEnv = process.env): string {
-  if (env.FART_PICKER_DATA_DIR) return env.FART_PICKER_DATA_DIR;
-  if (isHostedDeployment(env) || env.NODE_ENV === "production") return "/tmp/fart_picker_data";
+  if (env.LLMLAB_DATA_DIR) return env.LLMLAB_DATA_DIR;
+  if (isHostedDeployment(env) || env.NODE_ENV === "production") return "/tmp/llmlab_data";
   return join(process.cwd(), "data");
 }
 
