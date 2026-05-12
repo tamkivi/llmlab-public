@@ -1,0 +1,40 @@
+{
+  "name": "fart_picker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "tsx --tsconfig tsconfig.scripts.json -r ./scripts/_preload.cjs --test tests/**/*.test.ts",
+    "lint": "eslint 'src/**/*.{ts,tsx}' 'tests/**/*.ts'",
+    "db:audit": "curl -s -H \"Authorization: Bearer $ADMIN_API_TOKEN\" http://localhost:3000/api/db/audit | python3 -m json.tool || echo 'Run `npm run dev` first and set ADMIN_API_TOKEN'",
+    "db:backfill-price-history": "curl -s -X POST -H \"Authorization: Bearer $ADMIN_API_TOKEN\" http://localhost:3000/api/db/backfill-price-history | python3 -m json.tool || echo 'Run `npm run dev` first and set ADMIN_API_TOKEN'",
+    "pricing:refresh": "tsx --tsconfig tsconfig.scripts.json -r ./scripts/_preload.cjs scripts/refresh-pricing.ts"
+  },
+  "dependencies": {
+    "next": "16.2.6",
+    "nodemailer": "^8.0.7",
+    "pg": "^8.18.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "server-only": "^0.0.1",
+    "stripe": "^20.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^25.2.3",
+    "@types/nodemailer": "^7.0.10",
+    "@types/pg": "^8.16.0",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.6",
+    "tailwindcss": "^4",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  },
+  "overrides": {
+    "postcss": "8.5.10"
+  }
+}
