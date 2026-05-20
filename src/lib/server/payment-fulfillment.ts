@@ -15,6 +15,7 @@ import { sendAdminPaymentNotificationEmail, sendPaymentConfirmationEmail } from 
 import { logEvent, safeErrorReason } from "@/lib/server/structured-log";
 
 type FulfillmentResult = {
+  paymentConfirmed: boolean;
   fulfilled: boolean;
   alreadyPaid: boolean;
   customerEmailSent: boolean;
@@ -37,7 +38,7 @@ export async function fulfillPaidCheckoutSession({
 }): Promise<FulfillmentResult> {
   let order = await getOrderByCheckoutSession(checkoutSessionId);
   if (!order) {
-    return { fulfilled: false, alreadyPaid: false, customerEmailSent: false, adminEmailSent: false };
+    return { paymentConfirmed: false, fulfilled: false, alreadyPaid: false, customerEmailSent: false, adminEmailSent: false };
   }
 
   if (order.status === "PAID") {
@@ -50,7 +51,7 @@ export async function fulfillPaidCheckoutSession({
     if (order?.status === "PAID") {
       return sendMissingPaidOrderEmails({ checkoutSessionId, order, fulfilled: false, alreadyPaid: true });
     }
-    return { fulfilled: false, alreadyPaid: true, customerEmailSent: false, adminEmailSent: false };
+    return { paymentConfirmed: false, fulfilled: false, alreadyPaid: true, customerEmailSent: false, adminEmailSent: false };
   }
 
   order = await getOrderByCheckoutSession(checkoutSessionId) ?? order;
@@ -69,12 +70,12 @@ async function sendMissingPaidOrderEmails({
   alreadyPaid: boolean;
 }): Promise<FulfillmentResult> {
   if (order.status !== "PAID") {
-    return { fulfilled, alreadyPaid, customerEmailSent: false, adminEmailSent: false };
+    return { paymentConfirmed: fulfilled, fulfilled, alreadyPaid, customerEmailSent: false, adminEmailSent: false };
   }
 
   const emailPayload = await getPaidOrderEmailPayloadByCheckoutSession(checkoutSessionId);
   if (!emailPayload) {
-    return { fulfilled, alreadyPaid, customerEmailSent: false, adminEmailSent: false };
+    return { paymentConfirmed: fulfilled, fulfilled, alreadyPaid, customerEmailSent: false, adminEmailSent: false };
   }
 
   let customer: EmailSendResult = { sent: false, reason: order.customer_email_sent_at ? "already sent" : "not attempted" };
@@ -170,6 +171,7 @@ async function sendMissingPaidOrderEmails({
   }
 
   return {
+    paymentConfirmed: fulfilled,
     fulfilled,
     alreadyPaid,
     customerEmailSent: customer.sent,

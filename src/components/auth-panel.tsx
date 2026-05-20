@@ -33,6 +33,8 @@ export function AuthPanel() {
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [sessionLoading, setSessionLoading] = useState(false);
+  const [sessionLoaded, setSessionLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<AuthMode>("login");
   const [isMobile, setIsMobile] = useState(false);
@@ -61,11 +63,17 @@ export function AuthPanel() {
     });
   }, [positionPanel]);
 
-  async function refreshMe() {
-    const response = await fetch("/api/auth/me", { cache: "no-store" });
-    const data = (await response.json()) as MeResponse;
-    setMe(data);
-  }
+  const refreshMe = useCallback(async () => {
+    setSessionLoading(true);
+    try {
+      const response = await fetch("/api/auth/me", { cache: "no-store" });
+      const data = (await response.json()) as MeResponse;
+      setMe(data);
+      setSessionLoaded(true);
+    } finally {
+      setSessionLoading(false);
+    }
+  }, []);
 
   const refreshPendingCheckoutState = useCallback(() => {
     const pending = readPendingCheckoutIntent();
@@ -142,20 +150,12 @@ export function AuthPanel() {
   }
 
   useEffect(() => {
-    let cancelled = false;
-    fetch("/api/auth/me", { cache: "no-store" })
-      .then((response) => response.json() as Promise<MeResponse>)
-      .then((data) => {
-        if (!cancelled) setMe(data);
-      })
-      .catch(() => {
-        if (!cancelled) setMessage("Failed to load account session.");
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (!open || sessionLoaded || sessionLoading) return;
+    refreshMe().catch(() => {
+      setSessionLoaded(true);
+      setMessage("Failed to load account session.");
+    });
+  }, [open, refreshMe, sessionLoaded, sessionLoading]);
 
   useEffect(() => {
     const handleOpenAuthPanel = (event: Event) => {
@@ -310,7 +310,9 @@ export function AuthPanel() {
                 style={isMobile ? undefined : { top: panelPosition.top, left: panelPosition.left, width: "min(92vw, 360px)" }}
               >
                 {message ? <p className="mb-3 text-xs text-[color:var(--muted)]">{message}</p> : null}
-                {me?.user ? (
+                {sessionLoading && !sessionLoaded ? (
+                  <p className="text-sm text-[color:var(--muted)]">Checking account...</p>
+                ) : me?.user ? (
                   <div>
                     <p className="font-semibold">Signed in</p>
                     <p className="mt-1 text-sm text-[color:var(--muted)]">{me.user.email}</p>

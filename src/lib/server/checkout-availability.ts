@@ -15,15 +15,24 @@ import {
   initDb,
   listEstonianPriceChecks,
   listLatestEstonianPriceCheckMetadata,
+  listPriceTrackableCatalogItems,
   type EstonianPriceCheckRecord,
   type OrderItemType,
   type ProfileBuildWithNamesRecord,
 } from "@/lib/db";
+import {
+  hasCategoryValidationMarker,
+  priceMateriallyDeviates,
+  priceWithinCategoryReferenceBounds,
+  requiredCheckoutSampleCount,
+  type PricingValidationCategory,
+} from "@/lib/component-pricing-validation";
 import { ASSEMBLY_MARKUP_MULTIPLIER } from "@/lib/pricing-constants";
 
 export const CHECKOUT_UNAVAILABLE_MESSAGE = "Online checkout is not available yet. Please request a quote.";
 export const DIRECT_CHECKOUT_PRICE_MAX_AGE_HOURS_DEFAULT = 24;
 export const DIRECT_CHECKOUT_PRICE_MAX_AGE_HOURS_LIMIT = 48;
+export const DIRECT_CHECKOUT_MAX_ORDER_EUR_ENV = "DIRECT_CHECKOUT_MAX_ORDER_EUR";
 
 type CheckoutAvailability = {
   available: boolean;
@@ -43,9 +52,11 @@ export type CheckoutEligibilityReason =
   | "quote_only"
   | "out_of_stock"
   | "missing_price"
+  | "missing_trusted_component_pricing"
   | "fallback_pricing"
   | "stale_pricing"
   | "pricing_unhealthy"
+  | "order_limit_exceeded"
   | "item_not_found";
 
 export type DirectCheckoutItemType =
@@ -73,12 +84,24 @@ export type CheckoutEligibility = {
   orderPriceEur?: number;
   amountEurCents?: number;
   maxPriceAgeHours: number;
+  maxOrderEur?: number | null;
+  blockers?: CheckoutEligibilityBlocker[];
+};
+
+export type CheckoutEligibilityBlocker = {
+  label: string;
+  category: DirectCheckoutItemType;
+  itemId: number;
+  reason: CheckoutEligibilityReason;
+  message: string;
 };
 
 type CheckoutPriceCheck = Pick<
   EstonianPriceCheckRecord,
-  "category" | "item_id" | "market_avg_eur" | "assembly_markup_pct" | "final_price_eur" | "sample_count" | "checked_at"
->;
+  "category" | "item_id" | "base_price_eur" | "market_avg_eur" | "assembly_markup_pct" | "final_price_eur" | "sample_count" | "sources" | "checked_at"
+> & {
+  catalog_base_price_eur?: number;
+};
 
 type CheckoutPriceLookup = {
   trusted: Map<string, CheckoutPriceCheck>;
@@ -99,9 +122,11 @@ const BLOCKED_MESSAGES: Record<CheckoutEligibilityReason, string> = {
   quote_only: "This product requires a custom quote and is not available through direct checkout.",
   out_of_stock: "Direct checkout is quote-only while availability is being confirmed.",
   missing_price: "Direct checkout is quote-only because pricing data is incomplete.",
+  missing_trusted_component_pricing: "Direct checkout is quote-only because one or more build components lack trusted market pricing.",
   fallback_pricing: "Direct checkout is quote-only until fresh Estonian market pricing is available.",
   stale_pricing: "Direct checkout is quote-only because the latest market pricing is stale.",
   pricing_unhealthy: "Direct checkout is quote-only until pricing data passes checkout safety checks.",
+  order_limit_exceeded: "Direct checkout is quote-only because the trusted build total exceeds the online checkout limit.",
   item_not_found: "Item not found.",
 };
 
@@ -199,6 +224,13 @@ export function getDirectCheckoutPriceCutoffIso(env: NodeJS.ProcessEnv = process
   return new Date(nowMs - getDirectCheckoutPriceMaxAgeHours(env) * 60 * 60 * 1000).toISOString();
 }
 
+export function getDirectCheckoutMaxOrderEur(env: NodeJS.ProcessEnv = process.env): number | null {
+  const raw = env[DIRECT_CHECKOUT_MAX_ORDER_EUR_ENV] ?? env.CHECKOUT_MAX_ORDER_EUR;
+  if (!raw) return null;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 export function orderItemTypeToCheckoutItemType(itemType: OrderItemType): DirectCheckoutItemType {
   const lookup: Record<OrderItemType, DirectCheckoutItemType> = {
     PROFILE_BUILD: "profile_build",
@@ -215,12 +247,20 @@ export function orderItemTypeToCheckoutItemType(itemType: OrderItemType): Direct
   return lookup[itemType];
 }
 
-function blocked(reason: CheckoutEligibilityReason, env: NodeJS.ProcessEnv = process.env): CheckoutEligibility {
+function blocked(
+  reason: CheckoutEligibilityReason,
+  env: NodeJS.ProcessEnv = process.env,
+  options: Partial<Pick<CheckoutEligibility, "message" | "orderPriceEur" | "amountEurCents" | "maxOrderEur" | "blockers">> = {},
+): CheckoutEligibility {
   return {
     eligible: false,
     reason,
-    message: BLOCKED_MESSAGES[reason],
+    message: options.message ?? BLOCKED_MESSAGES[reason],
     maxPriceAgeHours: getDirectCheckoutPriceMaxAgeHours(env),
+    maxOrderEur: options.maxOrderEur ?? getDirectCheckoutMaxOrderEur(env),
+    orderPriceEur: options.orderPriceEur,
+    amountEurCents: options.amountEurCents,
+    blockers: options.blockers,
   };
 }
 
@@ -231,6 +271,7 @@ function eligible(orderPriceEur: number, env: NodeJS.ProcessEnv = process.env): 
     orderPriceEur,
     amountEurCents: orderPriceEur * 100,
     maxPriceAgeHours: getDirectCheckoutPriceMaxAgeHours(env),
+    maxOrderEur: getDirectCheckoutMaxOrderEur(env),
   };
 }
 
@@ -251,13 +292,18 @@ function hasCheckoutMarkup(check: CheckoutPriceCheck): boolean {
 }
 
 async function buildCheckoutPriceLookup(): Promise<CheckoutPriceLookup> {
-  const [trustedRows, latestRows] = await Promise.all([
+  const [trustedRows, latestRows, catalogBaseRows] = await Promise.all([
     listEstonianPriceChecks(),
     listLatestEstonianPriceCheckMetadata(),
+    listPriceTrackableCatalogItems(),
   ]);
+  const catalogBaseByKey = new Map(catalogBaseRows.map((row) => [key(row.category, row.itemId), row.basePriceEur]));
 
   return {
-    trusted: new Map(trustedRows.map((row) => [key(row.category, row.item_id), row])),
+    trusted: new Map(trustedRows.map((row) => [key(row.category, row.item_id), {
+      ...row,
+      catalog_base_price_eur: catalogBaseByKey.get(key(row.category, row.item_id)) ?? row.base_price_eur,
+    }])),
     latest: new Map(latestRows.map((row) => [key(row.category, row.item_id), {
       checkedAt: row.checked_at,
       sampleCount: row.sample_count,
@@ -284,6 +330,21 @@ function resolveCheckoutPrice(
   }
 
   if (!hasCheckoutMarkup(price)) {
+    return { ok: false, reason: "pricing_unhealthy" };
+  }
+
+  const validationCategory = category as PricingValidationCategory;
+  const referenceBase = price.catalog_base_price_eur ?? price.base_price_eur;
+  if (!hasCategoryValidationMarker(validationCategory, price.sources)) {
+    return { ok: false, reason: "pricing_unhealthy" };
+  }
+  if (!priceWithinCategoryReferenceBounds(validationCategory, price.market_avg_eur, referenceBase)) {
+    return { ok: false, reason: "pricing_unhealthy" };
+  }
+  if (price.sample_count < requiredCheckoutSampleCount(price.sources)) {
+    return { ok: false, reason: "pricing_unhealthy" };
+  }
+  if (price.sample_count < 3 && priceMateriallyDeviates(validationCategory, price.market_avg_eur, referenceBase)) {
     return { ok: false, reason: "pricing_unhealthy" };
   }
 
@@ -351,9 +412,39 @@ async function isInventoryAvailable(category: Exclude<DirectCheckoutItemType, "p
 }
 
 function availabilityBlockIfNeeded(env: NodeJS.ProcessEnv, orderPriceEur: number): CheckoutEligibility {
+  const maxOrderEur = getDirectCheckoutMaxOrderEur(env);
+  if (maxOrderEur !== null && orderPriceEur > maxOrderEur) {
+    return blocked("order_limit_exceeded", env, {
+      orderPriceEur,
+      amountEurCents: orderPriceEur * 100,
+      maxOrderEur,
+      message: `Direct checkout is quote-only because the trusted order total €${orderPriceEur.toLocaleString()} exceeds the online checkout limit of €${maxOrderEur.toLocaleString()}.`,
+    });
+  }
+
   return getCheckoutAvailability(env).available
     ? eligible(orderPriceEur, env)
     : blocked("checkout_env_unavailable", env);
+}
+
+function buildComponentBlocker(input: {
+  label: string;
+  category: Exclude<DirectCheckoutItemType, "profile_build">;
+  itemId: number;
+  reason: CheckoutEligibilityReason;
+}): CheckoutEligibilityBlocker {
+  return {
+    label: input.label,
+    category: input.category,
+    itemId: input.itemId,
+    reason: input.reason,
+    message: BLOCKED_MESSAGES[input.reason],
+  };
+}
+
+function topLevelBuildReason(componentReason: CheckoutEligibilityReason): CheckoutEligibilityReason {
+  if (componentReason === "stale_pricing" || componentReason === "out_of_stock") return componentReason;
+  return "missing_trusted_component_pricing";
 }
 
 export async function getCatalogItemCheckoutEligibility(
@@ -398,22 +489,34 @@ export async function getBuildCheckoutEligibility(
   for (const slot of BUILD_COMPONENT_SLOTS) {
     const itemId = build[slot.idKey];
     if (typeof itemId !== "number" || itemId <= 0) {
-      return blocked("missing_price", env);
+      return blocked("missing_trusted_component_pricing", env, {
+        blockers: [{
+          label: slot.label,
+          category: slot.category,
+          itemId: 0,
+          reason: "missing_price",
+          message: BLOCKED_MESSAGES.missing_price,
+        }],
+      });
     }
 
     if (!(await isInventoryAvailable(slot.category, itemId))) {
-      return blocked("out_of_stock", env);
+      return blocked("out_of_stock", env, {
+        blockers: [buildComponentBlocker({ label: slot.label, category: slot.category, itemId, reason: "out_of_stock" })],
+      });
     }
 
     const price = resolveCheckoutPrice(slot.category, itemId, priceLookup, env);
     if (!price.ok) {
-      return blocked(price.reason, env);
+      return blocked(topLevelBuildReason(price.reason), env, {
+        blockers: [buildComponentBlocker({ label: slot.label, category: slot.category, itemId, reason: price.reason })],
+      });
     }
     orderPriceEur += price.orderPriceEur;
   }
 
   if (orderPriceEur <= 0) {
-    return blocked("missing_price", env);
+    return blocked("missing_trusted_component_pricing", env);
   }
 
   return availabilityBlockIfNeeded(env, orderPriceEur);

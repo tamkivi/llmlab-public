@@ -1,6 +1,12 @@
 import "server-only";
 import { getAdapter } from "./adapter";
 import type { DbAdapter } from "./adapter";
+import {
+  ORDER_ITEM_TYPES,
+  QUOTE_PRODUCT_TYPES,
+  assertCommerceInvariantsSatisfied,
+  sqlLiteralList,
+} from "./invariants";
 
 type Migration = {
   version: number;
@@ -1145,6 +1151,125 @@ const migrations: Migration[] = [
       await db.execute("CREATE INDEX IF NOT EXISTS idx_runtime_locks_expires_at ON runtime_locks(expires_at)");
     },
   },
+  {
+    version: 32,
+    name: "payment_confirmation_marker",
+    up: async (db) => {
+      try {
+        await db.execute("ALTER TABLE orders ADD COLUMN payment_confirmed_at TEXT");
+      } catch { /* already exists */ }
+      await db.execute(
+        "UPDATE orders SET payment_confirmed_at = COALESCE(payment_confirmed_at, paid_at) WHERE status = 'PAID' AND paid_at IS NOT NULL",
+      );
+      await db.execute(
+        "UPDATE orders SET fulfilled_at = NULL WHERE payment_confirmed_at IS NOT NULL",
+      );
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_payment_confirmed_at ON orders(payment_confirmed_at)");
+    },
+  },
+  {
+    version: 33,
+    name: "commerce_invariant_guards",
+    up: async (db) => {
+      await assertCommerceInvariantsSatisfied(db);
+      const orderTypeList = sqlLiteralList(ORDER_ITEM_TYPES);
+      const quoteTypeList = sqlLiteralList(QUOTE_PRODUCT_TYPES);
+      const orderPaymentStateCheckFor = (prefix = "") => `
+        (
+          (${prefix}status = 'PAID' AND ${prefix}paid_at IS NOT NULL AND ${prefix}payment_confirmed_at IS NOT NULL)
+          OR
+          (${prefix}status <> 'PAID' AND ${prefix}paid_at IS NULL AND ${prefix}payment_confirmed_at IS NULL AND ${prefix}fulfilled_at IS NULL)
+        )
+      `;
+
+      if (db.dialect === "postgres") {
+        await db.execute("ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_amount_positive_check");
+        await db.execute("ALTER TABLE orders ADD CONSTRAINT orders_amount_positive_check CHECK(amount_eur_cents > 0)");
+        await db.execute("ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_currency_eur_check");
+        await db.execute("ALTER TABLE orders ADD CONSTRAINT orders_currency_eur_check CHECK(currency = 'eur')");
+        await db.execute("ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_item_type_check");
+        await db.execute(`ALTER TABLE orders ADD CONSTRAINT orders_item_type_check CHECK(order_item_type IN (${orderTypeList}))`);
+        await db.execute("ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_state_check");
+        await db.execute(`ALTER TABLE orders ADD CONSTRAINT orders_payment_state_check CHECK(${orderPaymentStateCheckFor()})`);
+        await db.execute("ALTER TABLE quote_requests DROP CONSTRAINT IF EXISTS quote_requests_product_type_check");
+        await db.execute(`ALTER TABLE quote_requests ADD CONSTRAINT quote_requests_product_type_check CHECK(product_type IN (${quoteTypeList}))`);
+      } else {
+        await db.execute(`DROP TRIGGER IF EXISTS trg_orders_commerce_invariants_insert`);
+        await db.execute(`DROP TRIGGER IF EXISTS trg_orders_commerce_invariants_update`);
+        await db.execute(`DROP TRIGGER IF EXISTS trg_quote_requests_product_type_insert`);
+        await db.execute(`DROP TRIGGER IF EXISTS trg_quote_requests_product_type_update`);
+        await db.execute(`
+          CREATE TRIGGER trg_orders_commerce_invariants_insert
+          BEFORE INSERT ON orders
+          BEGIN
+            SELECT CASE WHEN NEW.amount_eur_cents <= 0 THEN RAISE(ABORT, 'orders.amount_eur_cents must be positive') END;
+            SELECT CASE WHEN NEW.currency <> 'eur' THEN RAISE(ABORT, 'orders.currency must be eur') END;
+            SELECT CASE WHEN NEW.order_item_type NOT IN (${orderTypeList}) THEN RAISE(ABORT, 'orders.order_item_type is invalid') END;
+            SELECT CASE WHEN NOT ${orderPaymentStateCheckFor("NEW.")} THEN RAISE(ABORT, 'orders payment state invariant failed') END;
+          END
+        `);
+        await db.execute(`
+          CREATE TRIGGER trg_orders_commerce_invariants_update
+          BEFORE UPDATE ON orders
+          BEGIN
+            SELECT CASE WHEN NEW.amount_eur_cents <= 0 THEN RAISE(ABORT, 'orders.amount_eur_cents must be positive') END;
+            SELECT CASE WHEN NEW.currency <> 'eur' THEN RAISE(ABORT, 'orders.currency must be eur') END;
+            SELECT CASE WHEN NEW.order_item_type NOT IN (${orderTypeList}) THEN RAISE(ABORT, 'orders.order_item_type is invalid') END;
+            SELECT CASE WHEN NOT ${orderPaymentStateCheckFor("NEW.")} THEN RAISE(ABORT, 'orders payment state invariant failed') END;
+          END
+        `);
+        await db.execute(`
+          CREATE TRIGGER trg_quote_requests_product_type_insert
+          BEFORE INSERT ON quote_requests
+          BEGIN
+            SELECT CASE WHEN NEW.product_type NOT IN (${quoteTypeList}) THEN RAISE(ABORT, 'quote_requests.product_type is invalid') END;
+          END
+        `);
+        await db.execute(`
+          CREATE TRIGGER trg_quote_requests_product_type_update
+          BEFORE UPDATE ON quote_requests
+          BEGIN
+            SELECT CASE WHEN NEW.product_type NOT IN (${quoteTypeList}) THEN RAISE(ABORT, 'quote_requests.product_type is invalid') END;
+          END
+        `);
+      }
+
+      await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_order_price_snapshots_order_slot_unique ON order_price_snapshots(order_id, slot_key)");
+      await assertIndexExists(db, "order_price_snapshots", "idx_order_price_snapshots_order_slot_unique");
+    },
+  },
+  {
+    version: 34,
+    name: "admin_fulfillment_actions",
+    up: async (db) => {
+      for (const column of ["paid_at TEXT", "payment_confirmed_at TEXT", "fulfilled_at TEXT"]) {
+        try {
+          await db.execute(`ALTER TABLE orders ADD COLUMN ${column}`);
+        } catch { /* already exists */ }
+      }
+      await db.execute(
+        "UPDATE orders SET payment_confirmed_at = COALESCE(payment_confirmed_at, paid_at) WHERE status = 'PAID' AND paid_at IS NOT NULL",
+      );
+      try {
+        await db.execute("ALTER TABLE orders ADD COLUMN fulfilled_by_user_id INTEGER REFERENCES users(id)");
+      } catch { /* already exists */ }
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS admin_order_actions (
+          id ${generatedPrimaryKey(db)},
+          order_id INTEGER REFERENCES orders(id),
+          action TEXT NOT NULL CHECK(action IN ('stripe_reconcile', 'mark_fulfilled')),
+          actor_user_id INTEGER REFERENCES users(id),
+          result TEXT NOT NULL,
+          message TEXT NOT NULL DEFAULT '',
+          stripe_request_id TEXT,
+          created_at TEXT NOT NULL
+        )
+      `);
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_fulfillment_queue ON orders(status, payment_confirmed_at, fulfilled_at)");
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_admin_order_actions_created_at ON admin_order_actions(created_at DESC)");
+      await db.execute("CREATE INDEX IF NOT EXISTS idx_admin_order_actions_order_id ON admin_order_actions(order_id)");
+    },
+  },
 ];
 
 export async function hardenPriceHistoryDedupe(db: DbAdapter): Promise<void> {
@@ -1222,10 +1347,18 @@ export async function runMigrations(): Promise<void> {
     if (appliedVersions.has(migration.version)) continue;
     try {
       await migration.up(db);
-      await db.execute(
-        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-        [migration.version, migration.name, new Date().toISOString()],
-      );
+      if (db.dialect === "postgres") {
+        await db.execute(
+          "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?) ON CONFLICT (version) DO NOTHING",
+          [migration.version, migration.name, new Date().toISOString()],
+        );
+      } else {
+        await db.execute(
+          "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+          [migration.version, migration.name, new Date().toISOString()],
+        );
+      }
+      appliedVersions.add(migration.version);
     } catch (error) {
       console.error(`Migration v${migration.version} (${migration.name}) failed:`, error);
       throw error;

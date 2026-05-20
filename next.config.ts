@@ -109,7 +109,7 @@ const nextConfig: NextConfig = {
         headers: noStoreHeaders,
       },
       {
-        source: "/checkout/:path*",
+        source: "/checkout/success",
         headers: noStoreHeaders,
       },
     ];

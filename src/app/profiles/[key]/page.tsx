@@ -122,6 +122,13 @@ type ProfilePageParams = {
   searchParams?: Promise<{ sort?: string | string[] }>;
 };
 
+export const revalidate = 900;
+export const dynamicParams = true;
+
+export function generateStaticParams() {
+  return Object.keys(profileMeta).map((key) => ({ key }));
+}
+
 type BuildSortOption = "recommended" | "price-desc" | "price-asc";
 
 export async function generateMetadata({ params }: ProfilePageParams): Promise<Metadata> {

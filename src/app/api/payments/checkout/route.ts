@@ -21,7 +21,7 @@ import {
 } from "@/lib/server/checkout-availability";
 import { type CheckoutOrderPayload, resolveOpenCheckoutOrderForReuse } from "@/lib/server/checkout-reuse";
 import { logEvent, requestIdFromHeaders, safeErrorReason } from "@/lib/server/structured-log";
-import { getStripe } from "@/lib/stripe";
+import { getStripe, stripeRequestIdFromError, stripeRequestIdFromObject } from "@/lib/stripe";
 
 export const runtime = "nodejs";
 
@@ -122,6 +122,10 @@ function checkoutBlockedResponse(eligibility: CheckoutEligibility): NextResponse
     message: eligibility.message,
     reason: eligibility.reason,
     maxPriceAgeHours: eligibility.maxPriceAgeHours,
+    maxOrderEur: eligibility.maxOrderEur,
+    orderPriceEur: eligibility.orderPriceEur,
+    amountEurCents: eligibility.amountEurCents,
+    blockers: eligibility.blockers,
   }, { status });
 }
 
@@ -308,7 +312,14 @@ export async function POST(request: Request) {
         checkoutReused: true,
         durationMs: Date.now() - startedAt,
       });
-      return NextResponse.json({ checkoutUrl: initialDecision.checkoutUrl, reused: true });
+      return NextResponse.json({
+        checkoutUrl: initialDecision.checkoutUrl,
+        reused: true,
+        orderId: openOrder?.id,
+        amountEurCents: openOrder?.amount_eur_cents,
+        orderPriceEur: openOrder ? openOrder.amount_eur_cents / 100 : undefined,
+        buildName: openOrder?.build_name,
+      });
     }
 
     const isBuildOrder = itemType === "PROFILE_BUILD";
@@ -373,7 +384,14 @@ export async function POST(request: Request) {
         checkoutReused: true,
         durationMs: Date.now() - startedAt,
       });
-      return NextResponse.json({ checkoutUrl: postCreateDecision.checkoutUrl, reused: true });
+      return NextResponse.json({
+        checkoutUrl: postCreateDecision.checkoutUrl,
+        reused: true,
+        orderId: currentOrder?.id,
+        amountEurCents: currentOrder?.amount_eur_cents,
+        orderPriceEur: currentOrder ? currentOrder.amount_eur_cents / 100 : undefined,
+        buildName: currentOrder?.build_name,
+      });
     }
     if (postCreateDecision.action === "use_order") {
       order = postCreateDecision.order;
@@ -448,6 +466,7 @@ export async function POST(request: Request) {
         event: "checkout_session_create_failed",
         area: "checkout",
         requestId,
+        stripeRequestId: stripeRequestIdFromObject(session),
         reason: "stripe_session_missing_url",
         orderId: order.orderId,
         itemType,
@@ -488,13 +507,20 @@ export async function POST(request: Request) {
       checkoutReused: false,
       durationMs: Date.now() - startedAt,
     });
-    return NextResponse.json({ checkoutUrl: session.url });
+    return NextResponse.json({
+      checkoutUrl: session.url,
+      orderId: order.orderId,
+      amountEurCents: order.amountEurCents,
+      orderPriceEur: order.amountEurCents / 100,
+      buildName: order.buildName,
+    });
   } catch (error) {
     logEvent({
       level: "error",
       event: "checkout_initialization_failed",
       area: "checkout",
       requestId,
+      stripeRequestId: stripeRequestIdFromError(error),
       reason: safeErrorReason(error),
       durationMs: Date.now() - startedAt,
     });

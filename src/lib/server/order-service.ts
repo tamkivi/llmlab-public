@@ -70,8 +70,10 @@ export async function getAdminOrdersView() {
     itemId: order.order_item_id,
     checkoutSessionRef: shortRef(order.stripe_checkout_session_id),
     paymentIntentRef: shortRef(order.stripe_payment_intent_id),
+    paymentConfirmedAt: order.payment_confirmed_at ?? order.paid_at,
     paidAt: order.paid_at,
     fulfilledAt: order.fulfilled_at,
+    fulfilledByUserId: order.fulfilled_by_user_id,
     updatedAt: order.updated_at,
     createdAt: order.created_at,
     customerEmail: {
@@ -87,6 +89,11 @@ export async function getAdminOrdersView() {
     canRetryPaidEmails: order.status === "PAID"
       && Boolean(order.stripe_checkout_session_id)
       && (!order.customer_email_sent_at || !order.admin_email_sent_at),
+    canReconcileStripe: Boolean(order.stripe_checkout_session_id),
+    canMarkFulfilled: order.status === "PAID"
+      && Boolean(order.paid_at)
+      && Boolean(order.payment_confirmed_at)
+      && !order.fulfilled_at,
   }));
 }
 

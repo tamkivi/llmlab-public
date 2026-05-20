@@ -7,7 +7,8 @@ import {
   listAdminOverrideBackedPriceChecks,
   listAdminPricingOverrides,
 } from "@/lib/db";
-import { getCheckoutAvailability } from "@/lib/server/checkout-availability";
+import { getCommerceInvariantDiagnostics } from "@/lib/db/invariants";
+import { getBuildCheckoutEligibility, getCheckoutAvailability } from "@/lib/server/checkout-availability";
 
 type RecentWebhookFailure = {
   event_id: string;
@@ -35,6 +36,24 @@ type AmbiguousOrderRow = {
   updated_at: string;
 };
 
+type FulfillmentOrderRow = {
+  id: number;
+  payment_confirmed_at: string | null;
+  customer_email_sent_at: string | null;
+  admin_email_sent_at: string | null;
+  updated_at: string;
+};
+
+type RecentAdminOrderActionRow = {
+  id: number;
+  order_id: number | null;
+  action: string;
+  result: string;
+  message: string;
+  stripe_request_id: string | null;
+  created_at: string;
+};
+
 type QuoteAttentionRow = {
   id: number;
   status: string;
@@ -46,6 +65,11 @@ type QuoteAttentionRow = {
 type QuoteStatusCountRow = {
   status: string;
   cnt: number;
+};
+
+type BuildCheckoutReadinessRow = {
+  id: number;
+  build_name: string;
 };
 
 function lastSuccessAt(report: Awaited<ReturnType<typeof getPricingFreshnessReport>>): string | null {
@@ -65,6 +89,7 @@ export async function getOpsHealthSummary() {
   const cutoff24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const staleProcessingCutoff = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const staleCheckoutCutoff = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const staleFulfillmentCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
   const recentWebhookFailures = (await db.queryOne<{ cnt: number }>(
     "SELECT COUNT(*) AS cnt FROM stripe_webhook_events WHERE status = 'FAILED' AND updated_at >= ?",
@@ -91,6 +116,24 @@ export async function getOpsHealthSummary() {
     [staleCheckoutCutoff],
   ).catch(() => null))?.cnt ?? 0;
 
+  const paymentConfirmedUnfulfilledOrders = (await db.queryOne<{ cnt: number }>(
+    `SELECT COUNT(*) AS cnt
+     FROM orders
+     WHERE status = 'PAID'
+       AND payment_confirmed_at IS NOT NULL
+       AND fulfilled_at IS NULL`,
+  ).catch(() => null))?.cnt ?? 0;
+
+  const staleFulfillmentOrders = (await db.queryOne<{ cnt: number }>(
+    `SELECT COUNT(*) AS cnt
+     FROM orders
+     WHERE status = 'PAID'
+       AND payment_confirmed_at IS NOT NULL
+       AND fulfilled_at IS NULL
+       AND payment_confirmed_at < ?`,
+    [staleFulfillmentCutoff],
+  ).catch(() => null))?.cnt ?? 0;
+
   const quoteRequestsNeedingAttention = (await db.queryOne<{ cnt: number }>(
     "SELECT COUNT(*) AS cnt FROM quote_requests WHERE status IN ('NEW', 'CONTACTED', 'WAITING_CUSTOMER', 'QUOTED')",
   ).catch(() => null))?.cnt ?? 0;
@@ -100,7 +143,8 @@ export async function getOpsHealthSummary() {
     && recentWebhookFailures === 0
     && staleWebhookProcessing === 0
     && pendingPaidEmailRetries === 0
-    && ambiguousPaymentOrders === 0;
+    && ambiguousPaymentOrders === 0
+    && staleFulfillmentOrders === 0;
 
   return {
     status: healthy ? "healthy" as const : "degraded" as const,
@@ -116,6 +160,8 @@ export async function getOpsHealthSummary() {
     staleWebhookProcessing,
     pendingPaidEmailRetries,
     ambiguousPaymentOrders,
+    paymentConfirmedUnfulfilledOrders,
+    staleFulfillmentOrders,
     quoteRequestsNeedingAttention,
   };
 }
@@ -130,6 +176,7 @@ export async function getAdminOpsDiagnostics() {
     listAdminOverrideBackedPriceChecks(),
   ]);
   const staleCheckoutCutoff = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const staleFulfillmentCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
   const recentFailedWebhookEvents = await db.queryAll<RecentWebhookFailure>(
     `SELECT event_id, event_type, status, updated_at, last_error
@@ -159,6 +206,37 @@ export async function getAdminOpsDiagnostics() {
     [staleCheckoutCutoff],
   ).catch(() => []);
 
+  const paymentConfirmedUnfulfilledOrders = await db.queryAll<FulfillmentOrderRow>(
+    `SELECT id, payment_confirmed_at, customer_email_sent_at, admin_email_sent_at, updated_at
+     FROM orders
+     WHERE status = 'PAID'
+       AND payment_confirmed_at IS NOT NULL
+       AND fulfilled_at IS NULL
+     ORDER BY payment_confirmed_at ASC
+     LIMIT 50`,
+  ).catch(() => []);
+
+  const staleFulfillmentOrders = await db.queryAll<FulfillmentOrderRow>(
+    `SELECT id, payment_confirmed_at, customer_email_sent_at, admin_email_sent_at, updated_at
+     FROM orders
+     WHERE status = 'PAID'
+       AND payment_confirmed_at IS NOT NULL
+       AND fulfilled_at IS NULL
+       AND payment_confirmed_at < ?
+     ORDER BY payment_confirmed_at ASC
+     LIMIT 50`,
+    [staleFulfillmentCutoff],
+  ).catch(() => []);
+
+  const recentAdminOrderActions = await db.queryAll<RecentAdminOrderActionRow>(
+    `SELECT id, order_id, action, result, message, stripe_request_id, created_at
+     FROM admin_order_actions
+     ORDER BY created_at DESC, id DESC
+     LIMIT 20`,
+  ).catch(() => []);
+
+  const commerceInvariants = await getCommerceInvariantDiagnostics(db).catch(() => null);
+
   const quoteRequestsNeedingAttention = await db.queryAll<QuoteAttentionRow>(
     `SELECT id, status, product_type, product_id, created_at
      FROM quote_requests
@@ -173,6 +251,27 @@ export async function getAdminOpsDiagnostics() {
      GROUP BY status
      ORDER BY status ASC`,
   ).catch(() => []);
+
+  const buildCheckoutRows = await db.queryAll<BuildCheckoutReadinessRow>(
+    `SELECT id, build_name
+     FROM profile_builds
+     ORDER BY id ASC
+     LIMIT 30`,
+  ).catch(() => []);
+  const buildCheckoutReadiness = await Promise.all(buildCheckoutRows.map(async (build) => {
+    const eligibility = await getBuildCheckoutEligibility(build.id).catch((error) => ({
+      eligible: false,
+      reason: "pricing_unhealthy" as const,
+      message: error instanceof Error ? error.message : "Unable to resolve checkout eligibility.",
+      maxPriceAgeHours: 0,
+      blockers: [],
+    }));
+    return {
+      id: build.id,
+      buildName: build.build_name,
+      eligibility,
+    };
+  }));
 
   return {
     status: health.status,
@@ -206,6 +305,7 @@ export async function getAdminOpsDiagnostics() {
       staleChecks24h: pricing.staleChecks24h.slice(0, 50),
       criticalStaleChecks24h: pricing.criticalStaleChecks24h.slice(0, 50),
       backgroundStaleChecks24h: pricing.backgroundStaleChecks24h.slice(0, 50),
+      buildCheckoutReadiness,
       adminOverrides: activePricingOverrides,
       adminOverrideBackedChecks: overrideBackedPriceChecks,
     },
@@ -213,7 +313,11 @@ export async function getAdminOpsDiagnostics() {
       recentFailedWebhookEvents,
       paidEmailRetries,
       ambiguousPaymentOrders,
+      paymentConfirmedUnfulfilledOrders,
+      staleFulfillmentOrders,
+      recentAdminOrderActions,
     },
+    commerceInvariants,
     quotes: {
       statusCounts: Object.fromEntries(quoteStatusCounts.map((row) => [row.status, row.cnt])),
       needingAttention: quoteRequestsNeedingAttention,

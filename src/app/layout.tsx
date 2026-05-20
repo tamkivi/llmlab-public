@@ -63,12 +63,16 @@ export default async function RootLayout({
         <JsonLd data={[organizationJsonLd(), websiteJsonLd()]} />
         <div className="flex min-h-screen flex-col">
           <div className="flex-1">{children}</div>
-          {/* TODO: Add formal terms, returns, warranty, privacy, and business-identity links after human legal confirmation. */}
           <footer className="mx-auto flex w-full max-w-6xl flex-col gap-3 px-6 pb-8 pt-10 text-xs text-[color:var(--muted)] sm:flex-row sm:items-center sm:justify-between">
             <span>© {new Date().getFullYear()} LLMLab.ee</span>
             <nav className="flex flex-wrap gap-4" aria-label="Footer">
               <a href="/about" className="hover:text-[color:var(--foreground)]">About</a>
               <a href="/faq" className="hover:text-[color:var(--foreground)]">FAQ</a>
+              <a href="/terms" className="hover:text-[color:var(--foreground)]">Terms</a>
+              <a href="/privacy" className="hover:text-[color:var(--foreground)]">Privacy</a>
+              <a href="/returns" className="hover:text-[color:var(--foreground)]">Returns</a>
+              <a href="/warranty" className="hover:text-[color:var(--foreground)]">Warranty</a>
+              <a href="/contact" className="hover:text-[color:var(--foreground)]">Contact</a>
             </nav>
           </footer>
         </div>

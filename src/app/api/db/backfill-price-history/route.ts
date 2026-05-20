@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { backfillPriceHistoryFromChecks, normalizeCategoryRows } from "@/lib/db";
 import { checkRateLimit } from "@/lib/request-utils";
 import { requireAdminAccess } from "@/lib/server/admin-auth";
+import { revalidatePublicPricingCaches } from "@/lib/server/public-cache-invalidation";
 
 export const dynamic = "force-dynamic";
 
@@ -17,6 +18,9 @@ export async function POST(request: Request) {
 
   const normalized = await normalizeCategoryRows();
   const backfilled = await backfillPriceHistoryFromChecks();
+  const cacheInvalidation = normalized > 0 || backfilled.inserted + backfilled.updated > 0
+    ? revalidatePublicPricingCaches()
+    : null;
 
   return NextResponse.json({
     status: "ok",
@@ -24,5 +28,6 @@ export async function POST(request: Request) {
     updatedRows: backfilled.updated,
     targetDates: backfilled.targetDates,
     normalizedRows: normalized,
+    cacheInvalidation,
   });
 }

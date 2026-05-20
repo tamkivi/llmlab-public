@@ -1,4 +1,6 @@
 import "server-only";
+import { cache } from "react";
+import { unstable_cache } from "next/cache";
 import {
   getCaseById,
   getCompactAiSystemById,
@@ -37,8 +39,39 @@ import { ASSEMBLY_MARKUP_MULTIPLIER } from "@/lib/pricing-constants";
 import {
   getBuildCheckoutEligibility,
   getCatalogItemCheckoutEligibility,
+  type CheckoutEligibilityBlocker,
   type CheckoutEligibilityReason,
 } from "@/lib/server/checkout-availability";
+
+const PUBLIC_CATALOG_REVALIDATE_SECONDS = 15 * 60;
+
+type AsyncPublicLoader<Args extends unknown[], Result> = (...args: Args) => Promise<Result>;
+
+function isMissingIncrementalCache(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("incrementalCache missing");
+}
+
+function publicDataCache<Args extends unknown[], Result>(
+  loader: AsyncPublicLoader<Args, Result>,
+  keyParts: string[],
+  tags: string[],
+): AsyncPublicLoader<Args, Result> {
+  const nextCachedLoader = unstable_cache(loader, keyParts, {
+    revalidate: PUBLIC_CATALOG_REVALIDATE_SECONDS,
+    tags,
+  });
+
+  return cache(async (...args: Args) => {
+    try {
+      return await nextCachedLoader(...args);
+    } catch (error) {
+      if (isMissingIncrementalCache(error)) {
+        return loader(...args);
+      }
+      throw error;
+    }
+  });
+}
 
 type PublicPricingFields = PricingTransparency & {
   marketAvgEur: number | null;
@@ -252,6 +285,9 @@ export type PublicProfileBuild = {
   lowestSampleCount?: number | null;
   checkoutEligible?: boolean;
   checkoutDisabledReason?: CheckoutEligibilityReason;
+  checkoutBlockers?: CheckoutEligibilityBlocker[];
+  checkoutMaxOrderEur?: number | null;
+  checkoutOrderPriceEur?: number;
 };
 
 export type PublicMacEgpuBuild = {
@@ -482,7 +518,7 @@ function mapProfileBuild(build: ProfileBuildWithNamesRecord): PublicProfileBuild
 
 // ── Home catalog view (full) ──
 
-export async function getHomeCatalogView() {
+async function getHomeCatalogViewUncached() {
   const [gpuRows, cpuRows, ramKitRows, psuRows, caseRows, mbRows, compactRows, storageRows, coolerRows, macSystemRows, enclosureRows, profileRows, priceChecks, latestPriceMetadata] = await Promise.all([
     listGpus(), listCpus(), listRamKits(), listPowerSupplies(), listCases(), listMotherboards(),
     listCompactAiSystems(), listStorageDrives(), listCpuCoolers(), listMacSystems(),
@@ -544,9 +580,15 @@ export async function getHomeCatalogView() {
   return { gpus, cpus, ramKits, powerSupplies, cases, motherboards, compactAiSystems, storageDrives, cpuCoolers, macSystems, externalGpuEnclosures, profileBuilds };
 }
 
+export const getHomeCatalogView = publicDataCache(
+  getHomeCatalogViewUncached,
+  ["public-home-catalog-view-v1"],
+  ["public-catalog"],
+);
+
 // ── Profile-only view (lighter) ──
 
-export async function getProfileView() {
+async function getProfileViewUncached() {
   const [profileRows, compactRows, macEgpuRows, macSystemRows, enclosureRows, gpuRows, cpuRows, ramKitRows, storageRows, mbRows, psuRows, caseRows, coolerRows, priceChecks, latestPriceMetadata] = await Promise.all([
     listProfileBuilds(), listCompactAiSystems(), listMacEgpuBuilds(),
     listMacSystems(), listExternalGpuEnclosures(), listGpus(),
@@ -625,9 +667,15 @@ export async function getProfileView() {
   return { profileBuilds, compactAiSystems, macSystems, macEgpuBuilds };
 }
 
+export const getProfileView = publicDataCache(
+  getProfileViewUncached,
+  ["public-profile-view-v1"],
+  ["public-catalog"],
+);
+
 // ── Build detail ──
 
-export async function getBuildDetailView(buildId: number): Promise<PublicProfileBuild | null> {
+async function getBuildDetailViewUncached(buildId: number): Promise<PublicProfileBuild | null> {
   const build = await getProfileBuildById(buildId);
   if (!build) return null;
 
@@ -693,12 +741,21 @@ export async function getBuildDetailView(buildId: number): Promise<PublicProfile
     ...summarizeBuildPricing(build, pl),
     checkoutEligible: checkoutEligibility.eligible,
     checkoutDisabledReason: checkoutEligibility.reason,
+    checkoutBlockers: checkoutEligibility.blockers,
+    checkoutMaxOrderEur: checkoutEligibility.maxOrderEur,
+    checkoutOrderPriceEur: checkoutEligibility.orderPriceEur,
   };
 }
 
+export const getBuildDetailView = publicDataCache(
+  getBuildDetailViewUncached,
+  ["public-build-detail-view-v1"],
+  ["public-catalog", "public-build-detail"],
+);
+
 // ── Catalog item detail ──
 
-export async function getCatalogItemDetailView(itemType: CatalogItemType, itemId: number): Promise<PublicCatalogItemDetail | null> {
+async function getCatalogItemDetailViewUncached(itemType: CatalogItemType, itemId: number): Promise<PublicCatalogItemDetail | null> {
   const [pl, latest] = await Promise.all([buildPriceLookup(), buildLatestPriceMetadataLookup()]);
   const resolve = (cat: string, id: number, base: number) => resolvePrice(cat, id, base, pl, latest);
   const releaseLabel = (year: number, quarter: string) => (year > 0 ? `${year}${quarter ? ` ${quarter}` : ""}` : "n/a");
@@ -812,6 +869,12 @@ export async function getCatalogItemDetailView(itemType: CatalogItemType, itemId
   };
 }
 
+export const getCatalogItemDetailView = publicDataCache(
+  getCatalogItemDetailViewUncached,
+  ["public-catalog-item-detail-view-v1"],
+  ["public-catalog", "public-catalog-detail"],
+);
+
 // ── Price history ──
 
 export type PriceHistoryPoint = {
@@ -819,7 +882,7 @@ export type PriceHistoryPoint = {
   price: number;
 };
 
-export async function getPriceHistoryView(category: CatalogItemType, itemId: number, days = 30): Promise<PriceHistoryPoint[]> {
+async function getPriceHistoryViewUncached(category: CatalogItemType, itemId: number, days = 30): Promise<PriceHistoryPoint[]> {
   const rows = await getPriceHistory(category, itemId, days);
   const byDate = new Map<string, PriceHistoryPoint>();
   for (const row of rows) {
@@ -829,9 +892,38 @@ export async function getPriceHistoryView(category: CatalogItemType, itemId: num
   return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
 }
 
+export const getPriceHistoryView = publicDataCache(
+  getPriceHistoryViewUncached,
+  ["public-price-history-view-v1"],
+  ["public-catalog", "public-price-history"],
+);
+
+export type PriceHistoryRanges = {
+  "7d": PriceHistoryPoint[];
+  "30d": PriceHistoryPoint[];
+  "90d": PriceHistoryPoint[];
+};
+
+function filterPriceHistoryDays(points: PriceHistoryPoint[], days: number): PriceHistoryPoint[] {
+  const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return points.filter((point) => point.date >= cutoffDate);
+}
+
+export const getPriceHistoryRangesView = cache(async (
+  category: CatalogItemType,
+  itemId: number,
+): Promise<PriceHistoryRanges> => {
+  const priceHistory90d = await getPriceHistoryView(category, itemId, 90);
+  return {
+    "7d": filterPriceHistoryDays(priceHistory90d, 7),
+    "30d": filterPriceHistoryDays(priceHistory90d, 30),
+    "90d": priceHistory90d,
+  };
+});
+
 // ── Mac eGPU build detail ──
 
-export async function getMacEgpuBuildDetailView(buildId: number): Promise<PublicMacEgpuBuild | null> {
+async function getMacEgpuBuildDetailViewUncached(buildId: number): Promise<PublicMacEgpuBuild | null> {
   const build = await getMacEgpuBuildById(buildId);
   if (!build) return null;
 
@@ -857,3 +949,61 @@ export async function getMacEgpuBuildDetailView(buildId: number): Promise<Public
     buyerWarning: build.buyer_warning, notes: build.notes,
   };
 }
+
+export const getMacEgpuBuildDetailView = publicDataCache(
+  getMacEgpuBuildDetailViewUncached,
+  ["public-mac-egpu-build-detail-view-v1"],
+  ["public-catalog", "public-mac-egpu-detail"],
+);
+
+export const listCatalogDetailStaticParams = cache(async (): Promise<Array<{ type: string; id: string }>> => {
+  const [
+    gpuRows,
+    cpuRows,
+    ramKitRows,
+    psuRows,
+    caseRows,
+    mbRows,
+    compactRows,
+    storageRows,
+    coolerRows,
+    macSystemRows,
+    enclosureRows,
+  ] = await Promise.all([
+    listGpus(),
+    listCpus(),
+    listRamKits(),
+    listPowerSupplies(),
+    listCases(),
+    listMotherboards(),
+    listCompactAiSystems(),
+    listStorageDrives(),
+    listCpuCoolers(),
+    listMacSystems(),
+    listExternalGpuEnclosures(),
+  ]);
+
+  return [
+    ...gpuRows.map((row) => ({ type: "gpu", id: String(row.id) })),
+    ...cpuRows.map((row) => ({ type: "cpu", id: String(row.id) })),
+    ...ramKitRows.map((row) => ({ type: "ram_kit", id: String(row.id) })),
+    ...psuRows.map((row) => ({ type: "power_supply", id: String(row.id) })),
+    ...caseRows.map((row) => ({ type: "case", id: String(row.id) })),
+    ...mbRows.map((row) => ({ type: "motherboard", id: String(row.id) })),
+    ...compactRows.map((row) => ({ type: "compact_ai_system", id: String(row.id) })),
+    ...storageRows.map((row) => ({ type: "storage_drive", id: String(row.id) })),
+    ...coolerRows.map((row) => ({ type: "cpu_cooler", id: String(row.id) })),
+    ...macSystemRows.map((row) => ({ type: "mac_system", id: String(row.id) })),
+    ...enclosureRows.map((row) => ({ type: "external_gpu_enclosure", id: String(row.id) })),
+  ];
+});
+
+export const listBuildDetailStaticParams = cache(async (): Promise<Array<{ id: string }>> => {
+  const rows = await listProfileBuilds();
+  return rows.map((row) => ({ id: String(row.id) }));
+});
+
+export const listMacEgpuBuildDetailStaticParams = cache(async (): Promise<Array<{ id: string }>> => {
+  const rows = await listMacEgpuBuilds();
+  return rows.map((row) => ({ id: String(row.id) }));
+});

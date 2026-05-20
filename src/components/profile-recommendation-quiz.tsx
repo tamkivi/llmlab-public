@@ -249,7 +249,7 @@ function catalogHrefForCategory(category: Category) {
   return catalogHref({ filters })
 }
 
-export function ProfilePickerQuiz({ lang }: { lang: string }) {
+export function ProfileRecommendationQuiz({ lang }: { lang: string }) {
   const isEt = lang === "et"
   const [history, setHistory] = useState<string[]>(["q1"])
 

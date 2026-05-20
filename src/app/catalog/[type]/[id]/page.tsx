@@ -10,7 +10,13 @@ import { QuoteRequestForm } from "@/components/quote-request-form";
 import { BuyerTrustSection } from "@/components/buyer-trust-section";
 import { AssemblyQaChecklist } from "@/components/assembly-qa-checklist";
 import { TrustLinksSection } from "@/components/trust-links-section";
-import { type CatalogItemType, type PublicCatalogItemDetail, getCatalogItemDetailView, getPriceHistoryView } from "@/lib/server/catalog-service";
+import {
+  type CatalogItemType,
+  type PublicCatalogItemDetail,
+  getCatalogItemDetailView,
+  getPriceHistoryRangesView,
+  listCatalogDetailStaticParams,
+} from "@/lib/server/catalog-service";
 import { getRequestLanguage } from "@/lib/server/lang";
 import { JsonLd, pageMetadata, productJsonLd } from "@/lib/seo";
 import { workloadGuidance } from "@/lib/workload-guidance";
@@ -30,6 +36,13 @@ function parseCatalogType(value: string): CatalogItemType | null {
     "external_gpu_enclosure",
   ];
   return allowed.includes(value as CatalogItemType) ? (value as CatalogItemType) : null;
+}
+
+export const revalidate = 900;
+export const dynamicParams = true;
+
+export async function generateStaticParams() {
+  return listCatalogDetailStaticParams();
 }
 
 function extractSpecNumber(value?: string) {
@@ -114,11 +127,11 @@ export default async function CatalogDetailPage({
   const workloadFit = catalogWorkloadFit(item, lang);
   const brand = item.specs.find((spec) => ["Brand", "Vendor"].includes(spec.label))?.value;
 
-  const [priceHistory7d, priceHistory30d, priceHistory90d] = await Promise.all([
-    getPriceHistoryView(itemType, itemId, 7),
-    getPriceHistoryView(itemType, itemId, 30),
-    getPriceHistoryView(itemType, itemId, 90),
-  ]);
+  const {
+    "7d": priceHistory7d,
+    "30d": priceHistory30d,
+    "90d": priceHistory90d,
+  } = await getPriceHistoryRangesView(itemType, itemId);
 
   return (
     <main className="min-h-screen px-6 py-10 md:px-12">
@@ -193,6 +206,7 @@ export default async function CatalogDetailPage({
               ranges={{ "7d": priceHistory7d, "30d": priceHistory30d, "90d": priceHistory90d }}
               preorderPriceEur={item.preorderPriceEur}
               marketAvgEur={item.marketAvgEur}
+              checkedAt={item.checkedAt}
               isQuoteProduct={!directCheckoutEligible}
               lang={lang}
             />

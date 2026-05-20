@@ -12,8 +12,9 @@ import { getRequestLanguage } from "@/lib/server/lang";
 import { JsonLd, absoluteUrl, pageMetadata } from "@/lib/seo";
 import { estimateWorkloadTier, normalizeGpuVendor, workloadGuidance } from "@/lib/workload-guidance";
 import Link from "next/link";
+import { Suspense } from "react";
 
-export const revalidate = 3600;
+export const revalidate = 900;
 
 export const metadata = pageMetadata({
   title: "AI-ready computers for local LLMs",
@@ -331,7 +332,9 @@ export default async function Home() {
             </p>
           </div>
 
-          <CatalogBrowser groups={catalogGroups} lang={lang} />
+          <Suspense fallback={null}>
+            <CatalogBrowser groups={catalogGroups} lang={lang} />
+          </Suspense>
         </div>
       </section>
     </main>

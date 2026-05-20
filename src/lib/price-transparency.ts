@@ -53,7 +53,7 @@ export function getPriceTransparencyBadges(
   if (meta.priceSource === "market_live") {
     badges.push(updatedLabel(meta.checkedAt ? daysSince(meta.checkedAt, nowMs) : 0, lang));
     if ((meta.sampleCount ?? 0) < 2) badges.push(isEt ? "Väike valim" : "Low sample");
-    if (mode === "full" || badges.length < 2) badges.push(isEt ? "Eesti turu hinnang" : "Estonian market estimate");
+    if (mode === "full" || badges.length < 2) badges.push(isEt ? "Kontrollitud turuhind" : "Trusted market price");
     if (mode === "compact") return badges.slice(0, 2);
     badges.push(isEt ? "Sisaldab 15% kokkupanekut" : "Includes 15% assembly markup");
     return badges;

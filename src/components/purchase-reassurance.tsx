@@ -22,13 +22,15 @@ export function PurchaseReassurance({ lang = "en", mode = "payment", compact = f
         ])
     : (isEt
       ? [
-          "Saad tellimuse kinnituse e-postiga.",
+          "Pärast Stripe'i kinnitust saad tellimuse kinnituse e-postiga.",
+          "Kaardiandmed sisestatakse Stripe'i kassas; LLMLab.ee ei salvesta täielikke kaardinumbreid.",
           "Kontrollime komponentide saadavuse enne kokkupanekut.",
           "Plaanitud töövoog on osade tellimine, kokkupanek ja põhikontroll enne üleandmist.",
           "Kui mõni osa võib vajada asendust, võtame enne muudatust ühendust.",
         ]
       : [
-          "You receive an order confirmation email.",
+          "After Stripe confirms payment, you receive an order confirmation email.",
+          "Card details are entered in Stripe checkout; LLMLab.ee does not store full card numbers.",
           "We verify component availability before assembly.",
           "The planned workflow is parts sourcing, assembly, and baseline checks before handover.",
           "If a part may need substitution, we contact you before changing it.",

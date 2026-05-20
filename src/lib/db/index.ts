@@ -3,7 +3,14 @@ import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypt
 import { getAdapter } from "./adapter";
 import { runMigrations } from "./migrations";
 import { seedCatalog } from "./seed";
-import { ASSEMBLY_MARKUP_MULTIPLIER } from "@/lib/pricing-constants";
+import {
+  adminOverrideIsExpired,
+  categoryReferencePriceBounds,
+  hasCategoryValidationMarker,
+  isAdminOverrideSource,
+  isPricingValidationCategory,
+  priceWithinCategoryReferenceBounds,
+} from "@/lib/component-pricing-validation";
 
 export { getAdapter };
 import type {
@@ -30,6 +37,7 @@ import type {
   OrderItemType,
   UserOrderListItem,
   AdminOrderListItem,
+  AdminOrderActionRecord,
   AdminQuoteRequestListItem,
   PaidOrderEmailPayload,
   QuoteRequestRecord,
@@ -61,6 +69,7 @@ export type {
   OrderItemType,
   UserOrderListItem,
   AdminOrderListItem,
+  AdminOrderActionRecord,
   AdminQuoteRequestListItem,
   PaidOrderEmailPayload,
   QuoteRequestRecord,
@@ -111,7 +120,8 @@ export type {
 let initialized = false;
 let initPromise: Promise<void> | null = null;
 
-export const SEED_VERSION = 11;
+export const SEED_VERSION = 14;
+const CATALOG_SEED_LOCK_KEY = 2026051914;
 
 const TRUSTED_PRICE_MAX_AGE_HOURS = Number.parseInt(process.env.TRUSTED_PRICE_MAX_AGE_HOURS ?? "168", 10);
 const TRUSTED_PRICE_MIN_SAMPLES = Number.parseInt(process.env.TRUSTED_PRICE_MIN_SAMPLES ?? "1", 10);
@@ -162,6 +172,7 @@ function trustedPriceWhereClause(): string {
     AND base_price_eur > 0
     AND market_avg_eur > 0
     AND final_price_eur > 0
+    AND (sources LIKE ('%category_validated=' || category || '%') OR sources LIKE '%admin_override%')
     AND market_avg_eur BETWEEN base_price_eur * ${MARKET_PRICE_MIN_RATIO} AND base_price_eur * ${MARKET_PRICE_MAX_RATIO}
     AND ABS(final_price_eur - (market_avg_eur * (1 + assembly_markup_pct / 100.0))) <= 2
   `;
@@ -171,11 +182,58 @@ function trustedPriceParams(): [number, string] {
   return [trustedPriceMinSamples(), trustedPriceCutoff()];
 }
 
+type RuntimeTrustedPriceCheck = Pick<
+  EstonianPriceCheckRecord,
+  "category" | "item_id" | "base_price_eur" | "market_avg_eur" | "sources"
+>;
+
+async function currentCatalogBasePriceMap(db: ReturnType<typeof getAdapter>): Promise<Map<string, number>> {
+  const groups = await Promise.all(PRICE_TRACKABLE_CATALOG_TABLES.map(async ({ table, category, priceColumn }) => {
+    const rows = await db.queryAll<{ id: number; base_price_eur: number }>(
+      `SELECT id, ${priceColumn} AS base_price_eur FROM ${table} WHERE ${priceColumn} > 0`,
+    );
+    return rows.map((row) => [priceTrackableKey(category, row.id), Number(row.base_price_eur)] as const);
+  }));
+  return new Map(groups.flat());
+}
+
+function priceCheckPassesRuntimeTrust(
+  check: RuntimeTrustedPriceCheck,
+  currentBaseByKey: Map<string, number>,
+  nowMs = Date.now(),
+): boolean {
+  if (adminOverrideIsExpired(check.sources, nowMs)) return false;
+  const category = normalizePricingCategory(check.category);
+  if (!isPricingValidationCategory(category) || isAdminOverrideSource(check.sources)) return true;
+  const currentBase = currentBaseByKey.get(priceTrackableKey(category, check.item_id)) ?? check.base_price_eur;
+  return priceWithinCategoryReferenceBounds(category, check.market_avg_eur, currentBase);
+}
+
 type SeedRunRecord = {
   id: number;
   seed_version: number;
   applied_at: string;
 };
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function latestSeedRun(db: ReturnType<typeof getAdapter>): Promise<SeedRunRecord | null> {
+  return db.queryOne<SeedRunRecord>(
+    "SELECT id, seed_version, applied_at FROM seed_runs ORDER BY seed_version DESC LIMIT 1",
+  );
+}
+
+async function waitForSeedVersion(db: ReturnType<typeof getAdapter>, timeoutMs = 30_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const latestSeed = await latestSeedRun(db);
+    if (latestSeed && latestSeed.seed_version >= SEED_VERSION) return true;
+    await sleep(250);
+  }
+  return false;
+}
 
 export async function initDb(): Promise<void> {
   if (initialized) return;
@@ -185,18 +243,25 @@ export async function initDb(): Promise<void> {
     await runMigrations();
     const db = getAdapter();
 
-    const latestSeed = await db.queryOne<SeedRunRecord>(
-      "SELECT id, seed_version, applied_at FROM seed_runs ORDER BY seed_version DESC LIMIT 1",
-    );
+    const latestSeed = await latestSeedRun(db);
 
     if (!latestSeed || latestSeed.seed_version < SEED_VERSION) {
-      await seedCatalog(db);
-      await seedProfileBuilds(db);
-      await db.execute(
-        "INSERT INTO seed_runs (seed_version, applied_at) VALUES (?, ?)",
-        [SEED_VERSION, new Date().toISOString()],
-      );
-      console.log(`Seed v${SEED_VERSION} applied`);
+      const seedLock = await db.tryWithAdvisoryLock(CATALOG_SEED_LOCK_KEY, async () => {
+        const currentSeed = await latestSeedRun(db);
+        if (currentSeed && currentSeed.seed_version >= SEED_VERSION) return false;
+        await seedCatalog(db);
+        await seedProfileBuilds(db);
+        await db.execute(
+          "INSERT INTO seed_runs (seed_version, applied_at) VALUES (?, ?)",
+          [SEED_VERSION, new Date().toISOString()],
+        );
+        console.log(`Seed v${SEED_VERSION} applied`);
+        return true;
+      });
+
+      if (!seedLock.acquired && !(await waitForSeedVersion(db))) {
+        throw new Error(`Timed out waiting for seed v${SEED_VERSION} to finish.`);
+      }
     }
 
     initialized = true;
@@ -254,7 +319,7 @@ const PROFILE_BUILD_SELECT = `
 const ORDER_SELECT = `
   id, user_id, profile_build_id, order_item_type, order_item_id, build_name,
   amount_eur_cents, currency, status, stripe_checkout_session_id,
-  stripe_payment_intent_id, paid_at, fulfilled_at, customer_email_sent_at,
+  stripe_payment_intent_id, payment_confirmed_at, paid_at, fulfilled_at, fulfilled_by_user_id, customer_email_sent_at,
   admin_email_sent_at, customer_email_send_attempted_at, admin_email_send_attempted_at,
   customer_email_last_error, admin_email_last_error, created_at, updated_at
 `;
@@ -445,24 +510,32 @@ export async function getProfileBuildById(id: number): Promise<ProfileBuildWithN
 export async function getEstonianPriceCheck(category: string, itemId: number): Promise<{ final_price_eur: number; market_avg_eur: number } | null> {
   await initDb();
   const normalizedCategory = normalizePricingCategory(category);
-  return getAdapter().queryOne<{ final_price_eur: number; market_avg_eur: number }>(
-    `SELECT final_price_eur, market_avg_eur
+  const adapter = getAdapter();
+  const row = await adapter.queryOne<EstonianPriceCheckRecord>(
+    `SELECT id, category, item_id, item_name, base_price_eur, market_avg_eur, assembly_markup_pct, final_price_eur, sample_count, sources, checked_at
      FROM estonian_price_checks
      WHERE category = ? AND item_id = ? AND ${trustedPriceWhereClause()}
      LIMIT 1`,
     [normalizedCategory, itemId, ...trustedPriceParams()],
   );
+  if (!row) return null;
+  const currentBaseByKey = await currentCatalogBasePriceMap(adapter);
+  if (!priceCheckPassesRuntimeTrust(row, currentBaseByKey)) return null;
+  return { final_price_eur: row.final_price_eur, market_avg_eur: row.market_avg_eur };
 }
 
 export async function listEstonianPriceChecks(): Promise<EstonianPriceCheckRecord[]> {
   await initDb();
-  return getAdapter().queryAll<EstonianPriceCheckRecord>(
+  const adapter = getAdapter();
+  const rows = await adapter.queryAll<EstonianPriceCheckRecord>(
     `SELECT id, category, item_id, item_name, base_price_eur, market_avg_eur, assembly_markup_pct, final_price_eur, sample_count, sources, checked_at
      FROM estonian_price_checks
      WHERE ${trustedPriceWhereClause()}
      ORDER BY category, item_id`,
     trustedPriceParams(),
   );
+  const currentBaseByKey = await currentCatalogBasePriceMap(adapter);
+  return rows.filter((row) => priceCheckPassesRuntimeTrust(row, currentBaseByKey));
 }
 
 type LatestEstonianPriceCheckMetadata = Pick<EstonianPriceCheckRecord, "category" | "item_id" | "sample_count" | "checked_at">;
@@ -619,12 +692,24 @@ function validateMarketPriceInput(input: {
   if (!Number.isFinite(input.assemblyMarkupPct) || input.assemblyMarkupPct < 0 || input.assemblyMarkupPct > 100) errors.push("assemblyMarkupPct must be between 0 and 100");
   if (!Number.isInteger(input.sampleCount) || input.sampleCount < 1) errors.push("sampleCount must be at least 1");
   if (!input.sources.includes("match=")) errors.push("sources must include match diagnostics");
+  const adminOverride = isAdminOverrideSource(input.sources);
+  if (adminOverride && adminOverrideIsExpired(input.sources)) errors.push("admin override source is expired");
+  if (isPricingValidationCategory(normalizedCategory) && !hasCategoryValidationMarker(normalizedCategory, input.sources)) {
+    errors.push(`sources must include category validation for ${normalizedCategory}`);
+  }
 
   if (Number.isFinite(input.basePriceEur) && input.basePriceEur > 0 && Number.isFinite(input.marketAvgEur)) {
     const min = input.basePriceEur * MARKET_PRICE_MIN_RATIO;
     const max = input.basePriceEur * MARKET_PRICE_MAX_RATIO;
     if (input.marketAvgEur < min || input.marketAvgEur > max) {
       errors.push(`marketAvgEur is outside ${MARKET_PRICE_MIN_RATIO}x-${MARKET_PRICE_MAX_RATIO}x base price bounds`);
+    }
+
+    if (isPricingValidationCategory(normalizedCategory) && !adminOverride) {
+      const bounds = categoryReferencePriceBounds(normalizedCategory, input.basePriceEur);
+      if (!priceWithinCategoryReferenceBounds(normalizedCategory, input.marketAvgEur, input.basePriceEur)) {
+        errors.push(`${normalizedCategory} marketAvgEur is outside ${bounds.min.toFixed(2)}-${bounds.max.toFixed(2)} reference-relative bounds`);
+      }
     }
   }
 
@@ -721,13 +806,7 @@ function addUtcDays(dateKey: string, days: number): string {
 
 export async function backfillPriceHistoryFromChecks(options: { targetDates?: string[] } = {}): Promise<{ inserted: number; updated: number; targetDates: string[] }> {
   await initDb();
-  const db = getAdapter();
-  const checks = await db.queryAll<EstonianPriceCheckRecord>(
-    `SELECT category, item_id, market_avg_eur, sources, checked_at
-     FROM estonian_price_checks
-     WHERE ${trustedPriceWhereClause()}`,
-    trustedPriceParams(),
-  );
+  const checks = await listEstonianPriceChecks();
   let inserted = 0;
   let updated = 0;
   const today = utcDateKey(new Date());
@@ -1424,7 +1503,7 @@ export async function createPendingOrderForBuild({ userId, buildId }: { userId: 
 
   let totalEur = 0;
   let pricedLive = 0;
-  let pricedFallback = 0;
+  const pricedFallback = 0;
   const unpricedComponents: string[] = [];
   const componentSnapshots: Array<{
     slotKey: string;
@@ -1461,16 +1540,7 @@ export async function createPendingOrderForBuild({ userId, buildId }: { userId: 
       continue;
     }
 
-    const fallbackPrice = Math.round(item.price_eur * ASSEMBLY_MARKUP_MULTIPLIER);
-    totalEur += fallbackPrice;
-    pricedFallback++;
-    componentSnapshots.push({
-      slotKey: slot.cat,
-      itemId: id,
-      itemName: item.name,
-      unitPriceEur: fallbackPrice,
-      priceSource: "seed_fallback",
-    });
+    unpricedComponents.push(slot.label);
   }
 
   if (unpricedComponents.length > 0) {
@@ -1533,7 +1603,6 @@ export async function createPendingOrderForCatalogItem({ userId, itemType, itemI
 
   // Resolve item name and price
   let itemName = "Unknown item";
-  let basePriceEur = 0;
   let category = "";
 
   const resolvers: Record<string, () => Promise<{ name: string; price: number } | null>> = {
@@ -1551,7 +1620,7 @@ export async function createPendingOrderForCatalogItem({ userId, itemType, itemI
   const resolver = resolvers[itemType];
   if (resolver) {
     const resolved = await resolver();
-    if (resolved) { itemName = resolved.name; basePriceEur = resolved.price; }
+    if (resolved) itemName = resolved.name;
   }
 
   if (itemName === "Unknown item") return { ok: false, message: "Item not found." };
@@ -1560,7 +1629,10 @@ export async function createPendingOrderForCatalogItem({ userId, itemType, itemI
   const catMap: Record<string, string> = { GPU: "gpu", CPU: "cpu", RAM_KIT: "ram_kit", POWER_SUPPLY: "power_supply", CASE: "case", MOTHERBOARD: "motherboard", COMPACT_AI_SYSTEM: "compact_ai_system", STORAGE_DRIVE: "storage_drive", CPU_COOLER: "cpu_cooler" };
   category = catMap[itemType] ?? "";
   const priceCheck = category ? await getEstonianPriceCheck(category, itemId) : null;
-  const finalPriceEur = priceCheck ? Math.round(priceCheck.final_price_eur) : Math.round(basePriceEur * ASSEMBLY_MARKUP_MULTIPLIER);
+  if (!priceCheck) {
+    return { ok: false, message: "Cannot create order: no trusted market price available. Please request a quote." };
+  }
+  const finalPriceEur = Math.round(priceCheck.final_price_eur);
   const amountCents = finalPriceEur * 100;
 
   const now = new Date().toISOString();
@@ -1581,7 +1653,7 @@ export async function createPendingOrderForCatalogItem({ userId, itemType, itemI
       await tx.execute(
         `INSERT INTO order_price_snapshots (order_id, slot_key, order_item_type, item_id, item_name, unit_price_eur, price_source, created_at)
          VALUES (?, 'direct_item', ?, ?, ?, ?, ?, ?)`,
-        [insertedOrder.id, itemType, itemId, itemName, finalPriceEur, priceCheck ? "market_live" : "seed_fallback", now],
+        [insertedOrder.id, itemType, itemId, itemName, finalPriceEur, "market_live", now],
       );
 
       return insertedOrder;
@@ -1653,6 +1725,8 @@ export async function setOrderCheckoutSession({ orderId, checkoutSessionId }: { 
     `UPDATE orders
      SET status = 'CHECKOUT_CREATED', stripe_checkout_session_id = ?, updated_at = ?
      WHERE id = ?
+       AND status != 'PAID'
+       AND paid_at IS NULL
        AND (stripe_checkout_session_id IS NULL OR stripe_checkout_session_id = ?)`,
     [checkoutSessionId, new Date().toISOString(), orderId, checkoutSessionId],
   );
@@ -1666,12 +1740,12 @@ export async function markOrderPaidForFulfillment({ checkoutSessionId, paymentIn
     `UPDATE orders
      SET status = 'PAID',
          stripe_payment_intent_id = COALESCE(?, stripe_payment_intent_id),
+         payment_confirmed_at = COALESCE(payment_confirmed_at, paid_at, ?),
          paid_at = COALESCE(paid_at, ?),
-         fulfilled_at = COALESCE(fulfilled_at, ?),
          updated_at = ?
      WHERE stripe_checkout_session_id = ?
        AND status != 'PAID'
-       AND fulfilled_at IS NULL`,
+       AND paid_at IS NULL`,
     [paymentIntentId ?? null, now, now, now, checkoutSessionId],
   );
   return { won: updated === 1 };
@@ -1679,6 +1753,52 @@ export async function markOrderPaidForFulfillment({ checkoutSessionId, paymentIn
 
 export async function markOrderPaidFromCheckoutSession({ checkoutSessionId, paymentIntentId }: { checkoutSessionId: string; paymentIntentId?: string | null }): Promise<void> {
   await markOrderPaidForFulfillment({ checkoutSessionId, paymentIntentId });
+}
+
+export async function markOrderFulfilledForAdmin({
+  orderId,
+  adminUserId,
+}: {
+  orderId: number;
+  adminUserId?: number | null;
+}): Promise<
+  | { ok: true; fulfilled: boolean; alreadyFulfilled: boolean; fulfilledAt: string }
+  | { ok: false; reason: "not_found" | "not_payment_confirmed" }
+> {
+  await initDb();
+  const db = getAdapter();
+  const order = await getOrderById(orderId);
+  if (!order) return { ok: false, reason: "not_found" };
+  if (order.status !== "PAID" || !order.paid_at || !order.payment_confirmed_at) {
+    return { ok: false, reason: "not_payment_confirmed" };
+  }
+  if (order.fulfilled_at) {
+    return { ok: true, fulfilled: false, alreadyFulfilled: true, fulfilledAt: order.fulfilled_at };
+  }
+
+  const now = new Date().toISOString();
+  const updated = await db.execute(
+    `UPDATE orders
+     SET fulfilled_at = COALESCE(fulfilled_at, ?),
+         fulfilled_by_user_id = COALESCE(fulfilled_by_user_id, ?),
+         updated_at = ?
+     WHERE id = ?
+       AND status = 'PAID'
+       AND paid_at IS NOT NULL
+       AND payment_confirmed_at IS NOT NULL
+       AND fulfilled_at IS NULL`,
+    [now, adminUserId ?? null, now, orderId],
+  );
+
+  if (updated === 1) {
+    return { ok: true, fulfilled: true, alreadyFulfilled: false, fulfilledAt: now };
+  }
+
+  const refreshed = await getOrderById(orderId);
+  if (refreshed?.fulfilled_at) {
+    return { ok: true, fulfilled: false, alreadyFulfilled: true, fulfilledAt: refreshed.fulfilled_at };
+  }
+  return { ok: false, reason: "not_payment_confirmed" };
 }
 
 export async function markOrderCustomerEmailSent(checkoutSessionId: string): Promise<void> {
@@ -1754,7 +1874,7 @@ export async function releaseOrderAdminEmailSend(checkoutSessionId: string, erro
 export async function markOrderFailedFromCheckoutSession({ checkoutSessionId, paymentIntentId }: { checkoutSessionId: string; paymentIntentId?: string | null }): Promise<void> {
   await initDb();
   await getAdapter().execute(
-    "UPDATE orders SET status = 'FAILED', stripe_payment_intent_id = COALESCE(?, stripe_payment_intent_id), updated_at = ? WHERE stripe_checkout_session_id = ? AND status != 'PAID'",
+    "UPDATE orders SET status = 'FAILED', stripe_payment_intent_id = COALESCE(?, stripe_payment_intent_id), updated_at = ? WHERE stripe_checkout_session_id = ? AND status != 'PAID' AND paid_at IS NULL",
     [paymentIntentId ?? null, new Date().toISOString(), checkoutSessionId],
   );
 }
@@ -1762,7 +1882,7 @@ export async function markOrderFailedFromCheckoutSession({ checkoutSessionId, pa
 export async function markOrderCanceledFromCheckoutSession(checkoutSessionId: string): Promise<void> {
   await initDb();
   await getAdapter().execute(
-    "UPDATE orders SET status = 'CANCELED', updated_at = ? WHERE stripe_checkout_session_id = ? AND status != 'PAID'",
+    "UPDATE orders SET status = 'CANCELED', updated_at = ? WHERE stripe_checkout_session_id = ? AND status != 'PAID' AND paid_at IS NULL",
     [new Date().toISOString(), checkoutSessionId],
   );
 }
@@ -1838,7 +1958,7 @@ export async function markStripeWebhookEventFailed(eventId: string, errorMessage
 export async function markOrderCheckoutCreationFailed(orderId: number): Promise<void> {
   await initDb();
   await getAdapter().execute(
-    "UPDATE orders SET status = 'FAILED', updated_at = ? WHERE id = ?",
+    "UPDATE orders SET status = 'FAILED', updated_at = ? WHERE id = ? AND status != 'PAID' AND paid_at IS NULL",
     [new Date().toISOString(), orderId],
   );
 }
@@ -1856,10 +1976,52 @@ export async function listAllOrdersForAdmin(): Promise<AdminOrderListItem[]> {
   return getAdapter().queryAll<AdminOrderListItem>(
     `SELECT o.id, o.user_id, u.email AS user_email, o.profile_build_id, o.order_item_type, o.order_item_id,
             o.build_name, o.amount_eur_cents, o.currency, o.status, o.stripe_checkout_session_id,
-            o.stripe_payment_intent_id, o.paid_at, o.fulfilled_at, o.customer_email_sent_at,
+            o.stripe_payment_intent_id, o.payment_confirmed_at, o.paid_at, o.fulfilled_at, o.fulfilled_by_user_id, o.customer_email_sent_at,
             o.admin_email_sent_at, o.customer_email_send_attempted_at, o.admin_email_send_attempted_at,
             o.customer_email_last_error, o.admin_email_last_error, o.created_at, o.updated_at
      FROM orders o JOIN users u ON u.id = o.user_id ORDER BY o.id DESC`,
+  );
+}
+
+export async function recordAdminOrderAction({
+  orderId,
+  action,
+  actorUserId,
+  result,
+  message,
+  stripeRequestId,
+}: {
+  orderId?: number | null;
+  action: AdminOrderActionRecord["action"];
+  actorUserId?: number | null;
+  result: string;
+  message?: string;
+  stripeRequestId?: string | null;
+}): Promise<void> {
+  await initDb();
+  await getAdapter().execute(
+    `INSERT INTO admin_order_actions (order_id, action, actor_user_id, result, message, stripe_request_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      orderId ?? null,
+      action,
+      actorUserId ?? null,
+      result.slice(0, 80),
+      (message ?? "").slice(0, 500),
+      stripeRequestId ?? null,
+      new Date().toISOString(),
+    ],
+  );
+}
+
+export async function listRecentAdminOrderActions(limit = 20): Promise<AdminOrderActionRecord[]> {
+  await initDb();
+  const safeLimit = Math.min(50, Math.max(1, Math.floor(limit)));
+  return getAdapter().queryAll<AdminOrderActionRecord>(
+    `SELECT id, order_id, action, actor_user_id, result, message, stripe_request_id, created_at
+     FROM admin_order_actions
+     ORDER BY created_at DESC, id DESC
+     LIMIT ${safeLimit}`,
   );
 }
 
@@ -2160,28 +2322,27 @@ async function seedProfileBuilds(db: ReturnType<typeof getAdapter>): Promise<voi
   ]);
 
   const builds = [
-    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Flagship 24GB CUDA Inference", targetModel: "70B q4 (select workloads)", ramGb: 128, storageGb: 4000, estimatedPriceEur: 3349, bestFor: "70B quantized local inference with maximum VRAM", estimatedTokensPerSec: "8-15 t/s (70B q4)", estimatedSystemPowerW: 650, recommendedPsuW: 1500, coolingProfile: "High-airflow tower with 360mm AIO", cpuName: "AMD Ryzen 9 7950X", gpuName: "NVIDIA RTX 4090", ramName: "Corsair Vengeance 128GB (4x32GB) DDR5-5600 CL40", storageName: "Samsung 990 Pro 4TB", mbName: "MSI MAG X670E Tomahawk WiFi", psuName: "Corsair HX1500i 1500W", caseName: "Fractal Design Torrent", coolerName: "Arctic Liquid Freezer III 360", notes: "Best fit for users who want the strongest consumer CUDA box without stepping into pro GPUs. 24GB VRAM handles 13B-34B models comfortably and can run many 70B quantized setups with careful context settings.", sourceRefs: "nvidia.com, ir.amd.com", compatNotes: "" },
-    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Balanced NVIDIA 16GB", targetModel: "34B q4", ramGb: 64, storageGb: 2000, estimatedPriceEur: 2099, bestFor: "34B quantized local inference, strong tokens-per-watt", estimatedTokensPerSec: "15-25 t/s (34B q4)", estimatedSystemPowerW: 450, recommendedPsuW: 1000, coolingProfile: "Quiet air cooling with premium dual-tower", cpuName: "AMD Ryzen 9 7900", gpuName: "NVIDIA RTX 4080 SUPER", ramName: "Corsair Vengeance 64GB (2x32GB) DDR5-6000 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "Corsair RM1000e 1000W", caseName: "Corsair 5000D Airflow", coolerName: "Noctua NH-D15 G2", notes: "Balanced CUDA choice for local chat, coding assistants, embeddings, and 13B-34B quantized models. It avoids flagship pricing while keeping enough VRAM and system RAM for practical daily AI work.", sourceRefs: "nvidia.com, ir.amd.com", compatNotes: "" },
-    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "24GB VRAM Value (ROCm path)", targetModel: "34B q4 / 70B split", ramGb: 96, storageGb: 2000, estimatedPriceEur: 2249, bestFor: "ROCm-based inference with 24GB VRAM at lower cost", estimatedTokensPerSec: "10-18 t/s (34B q4, ROCm)", estimatedSystemPowerW: 500, recommendedPsuW: 1000, coolingProfile: "Balanced air cooling", cpuName: "Intel Core i7-14700K", gpuName: "AMD Radeon RX 7900 XTX", ramName: "Corsair Vengeance 96GB (2x48GB) DDR5-5600 CL40", storageName: "Samsung 990 Pro 2TB", mbName: "MSI MPG Z790 Carbon WiFi", psuName: "Corsair RM1000e 1000W", caseName: "Fractal Design Meshify 2", coolerName: "be quiet! Dark Rock Pro 5", notes: "Strong VRAM-per-euro option for buyers comfortable with the AMD ROCm path. Great for 13B-34B inference, but CUDA-only tools may need alternatives or extra setup work.", sourceRefs: "amd.com, intel.com", compatNotes: "" },
-    { profileKey: "llm-finetune-starter", profileLabel: "LLM Fine-Tune Starter", buildName: "CUDA Adapter-Tuning Starter", targetModel: "7B-13B LoRA", ramGb: 96, storageGb: 2000, estimatedPriceEur: 2399, bestFor: "LoRA/QLoRA fine-tuning on 7B-13B models", estimatedTokensPerSec: "Training: varies by batch size", estimatedSystemPowerW: 450, recommendedPsuW: 1000, coolingProfile: "Premium air cooling for sustained loads", cpuName: "AMD Ryzen 9 7950X", gpuName: "NVIDIA RTX 4070 Ti SUPER", ramName: "G.Skill Trident Z5 RGB 96GB (2x48GB) DDR5-6400 CL32", storageName: "Samsung 990 Pro 2TB", mbName: "ASUS ROG Crosshair X670E Hero", psuName: "SeaSonic Focus GX-1000 1000W", caseName: "Fractal Design North", coolerName: "Noctua NH-D15 G2", notes: "Starter tuning build for LoRA and QLoRA experiments where CUDA compatibility matters. The 96GB RAM leaves room for datasets, loaders, and dev tooling while the 16GB GPU keeps runs realistic for 7B-13B models.", sourceRefs: "nvidia.com, ir.amd.com", compatNotes: "" },
-    { profileKey: "llm-finetune-starter", profileLabel: "LLM Fine-Tune Starter", buildName: "Budget Fine-Tune Entry", targetModel: "7B LoRA / embeddings", ramGb: 64, storageGb: 2000, estimatedPriceEur: 1599, bestFor: "Entry-level LoRA fine-tuning and embedding workloads", estimatedTokensPerSec: "Training: varies by batch size", estimatedSystemPowerW: 300, recommendedPsuW: 750, coolingProfile: "Budget air cooling", cpuName: "AMD Ryzen 9 7900", gpuName: "NVIDIA RTX 4060 Ti 16GB", ramName: "G.Skill Flare X5 64GB (2x32GB) DDR5-5600 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "SeaSonic Focus GX-750 750W", caseName: "Fractal Design Pop Air", coolerName: "DeepCool AK620", notes: "Entry point for learning fine-tuning, embeddings, RAG pipelines, and small batch experiments. The 16GB VRAM is useful, but the narrow memory bus makes it a budget learning machine rather than a high-throughput trainer.", sourceRefs: "nvidia.com, ir.amd.com", compatNotes: "" },
-    { profileKey: "hybrid-ai-gaming", profileLabel: "Hybrid AI + Gaming", buildName: "4K Hybrid Flagship", targetModel: "34B q4 + 4K gaming", ramGb: 64, storageGb: 2000, estimatedPriceEur: 2499, bestFor: "Daytime AI development, nighttime 4K gaming", estimatedTokensPerSec: "15-25 t/s (34B q4)", estimatedSystemPowerW: 500, recommendedPsuW: 1000, coolingProfile: "AIO liquid cooling for quiet dual-use", cpuName: "Intel Core i9-14900K", gpuName: "NVIDIA RTX 4080 SUPER", ramName: "Corsair Dominator Titanium 64GB (2x32GB) DDR5-6600 CL32", storageName: "Samsung 990 Pro 2TB", mbName: "ASUS ROG Strix Z790-F Gaming WiFi", psuName: "Corsair RM1000e 1000W", caseName: "Lian Li O11 Dynamic EVO", coolerName: "Arctic Liquid Freezer III 280", notes: "Built for someone who wants one machine for serious 4K gaming, creator apps, and local AI. 16GB VRAM is enough for strong 13B-34B inference, while the high-end CPU keeps compile, render, and multitasking workloads responsive.", sourceRefs: "nvidia.com, intel.com", compatNotes: "" },
-    { profileKey: "hybrid-ai-gaming", profileLabel: "Hybrid AI + Gaming", buildName: "1440p AI Creator", targetModel: "13B-34B q4 + high refresh", ramGb: 64, storageGb: 2000, estimatedPriceEur: 1969, bestFor: "1440p high-refresh gaming and 13B-34B local inference", estimatedTokensPerSec: "12-20 t/s (34B q4)", estimatedSystemPowerW: 420, recommendedPsuW: 850, coolingProfile: "Compact AIO liquid cooling", cpuName: "Intel Core i7-14700K", gpuName: "NVIDIA RTX 4070 Ti SUPER", ramName: "Kingston Fury Renegade 64GB (2x32GB) DDR5-6000 CL32", storageName: "Samsung 990 Pro 2TB", mbName: "Gigabyte Z790 AORUS Elite AX", psuName: "Corsair RM850e 850W", caseName: "NZXT H7 Flow", coolerName: "Arctic Liquid Freezer III 240", notes: "Practical sweet spot for 1440p gaming, streaming, content creation, and local AI experiments. The 16GB CUDA GPU is the main reason to choose it over cheaper gaming-first systems.", sourceRefs: "nvidia.com, intel.com", compatNotes: "" },
-    { profileKey: "workstation-ai", profileLabel: "AI Workstation", buildName: "Threadripper 48GB Beast", targetModel: "70B q4 sustained", ramGb: 256, storageGb: 4000, estimatedPriceEur: 8499, bestFor: "Sustained 70B inference and workstation AI workloads", estimatedTokensPerSec: "8-15 t/s (70B q4)", estimatedSystemPowerW: 750, recommendedPsuW: 1600, coolingProfile: "Workstation-grade 420mm AIO cooling", cpuName: "AMD Threadripper 7960X", gpuName: "NVIDIA RTX 6000 Ada", ramName: "Kingston Server Premier 256GB (4x64GB) DDR5-4800 ECC RDIMM", storageName: "Samsung 990 Pro 4TB", mbName: "ASUS Pro WS WRX90E-SAGE SE", psuName: "be quiet! Dark Power Pro 13 1600W", caseName: "Phanteks Enthoo Pro 2", coolerName: "Arctic Liquid Freezer III 420", notes: "Professional single-GPU workstation for sustained 70B-class inference, large context windows, and heavy multitasking. The 48GB RTX 6000 Ada is the key upgrade: more VRAM, workstation thermals, and better fit for long unattended jobs.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
-    { profileKey: "multi-gpu-ai", profileLabel: "Multi-GPU AI", buildName: "Dual RTX 6000 Ada Tower", targetModel: "70B+ parallel inference", ramGb: 512, storageGb: 8000, estimatedPriceEur: 18999, bestFor: "Multi-GPU parallel inference and large-scale training", estimatedTokensPerSec: "Varies by pipeline parallelism", estimatedSystemPowerW: 1000, recommendedPsuW: 1600, coolingProfile: "Dual-GPU workstation cooling with 420mm AIO", cpuName: "AMD Threadripper PRO 7975WX", gpuName: "NVIDIA RTX 6000 Ada", ramName: "Kingston Server Premier 512GB (8x64GB) DDR5-4800 ECC RDIMM", storageName: "WD Black SN850X 8TB", mbName: "ASUS Pro WS WRX90E-SAGE SE", psuName: "be quiet! Dark Power Pro 13 1600W", caseName: "Phanteks Enthoo Pro 2", coolerName: "Arctic Liquid Freezer III 420", notes: "High-end multi-GPU tower for parallel inference, model serving, and experiments that can actually use two GPUs. Best for technical users who know their stack supports tensor or pipeline parallelism.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
-    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Efficient 20B Workstation", targetModel: "20B q4", ramGb: 64, storageGb: 2000, estimatedPriceEur: 1749, bestFor: "Efficient 20B local inference with low power draw", estimatedTokensPerSec: "18-30 t/s (20B q4)", estimatedSystemPowerW: 350, recommendedPsuW: 750, coolingProfile: "Budget tower air cooling", cpuName: "Intel Core i5-14600K", gpuName: "NVIDIA RTX 4070 SUPER", ramName: "Corsair Vengeance 64GB (2x32GB) DDR5-6000 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "ASRock Z790 Pro RS", psuName: "SeaSonic Focus GX-750 750W", caseName: "Corsair 4000D Airflow", coolerName: "Thermalright Phantom Spirit 120 EVO", notes: "Efficient CUDA build for 7B-20B inference, coding assistants, and private chat without excessive heat or power draw. The 12GB VRAM is the limiter, so choose this when efficiency matters more than large-model headroom.", sourceRefs: "nvidia.com, intel.com", compatNotes: "" },
-    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "AMD Value 16GB Inference", targetModel: "13B-20B q4", ramGb: 64, storageGb: 2000, estimatedPriceEur: 1599, bestFor: "Budget 16GB VRAM ROCm-based local inference", estimatedTokensPerSec: "12-20 t/s (13B q4, ROCm)", estimatedSystemPowerW: 350, recommendedPsuW: 750, coolingProfile: "Budget air cooling", cpuName: "AMD Ryzen 9 7900", gpuName: "AMD Radeon RX 7800 XT", ramName: "Kingston Fury Beast 64GB (2x32GB) DDR5-5200 CL40", storageName: "WD Black SN850X 2TB", mbName: "ASRock B650E Taichi", psuName: "SeaSonic Focus GX-750 750W", caseName: "Corsair 4000D Airflow", coolerName: "DeepCool AK620", notes: "Value-focused AMD inference build with enough VRAM for useful 13B and some 20B quantized work. Best when the target stack supports ROCm; choose NVIDIA instead if CUDA-only libraries are required.", sourceRefs: "amd.com", compatNotes: "" },
-    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Cheapest 12GB VRAM Build", targetModel: "7B q4", ramGb: 32, storageGb: 2000, estimatedPriceEur: 999, bestFor: "Absolute cheapest entry with 12GB VRAM for 7B model inference", estimatedTokensPerSec: "10-15 t/s (7B q4)", estimatedSystemPowerW: 250, recommendedPsuW: 550, coolingProfile: "Budget air cooling", cpuName: "AMD Ryzen 5 7600", gpuName: "NVIDIA RTX 3060 12GB", ramName: "Kingston Fury Beast 32GB (2x16GB) DDR5-6000 CL36", storageName: "WD Black SN850X 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "SeaSonic Focus GX-650 650W", caseName: "Corsair 4000D Airflow", coolerName: "Thermalright Phantom Spirit 120 SE", notes: "Lowest-cost sensible CUDA entry for local AI. Good for 7B quantized chat, embeddings, and learning Ollama or llama.cpp; 13B models may require tighter quantization and shorter context.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
-    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Blackwell 5070 Ti 16GB Build", targetModel: "34B q4", ramGb: 64, storageGb: 2000, estimatedPriceEur: 2199, bestFor: "Latest-gen Blackwell 16GB with GDDR7 bandwidth for efficient inference", estimatedTokensPerSec: "15-25 t/s (34B q4)", estimatedSystemPowerW: 450, recommendedPsuW: 850, coolingProfile: "Premium air cooling", cpuName: "AMD Ryzen 9 9900X", gpuName: "NVIDIA RTX 5070 Ti", ramName: "Corsair Vengeance 64GB (2x32GB) DDR5-6000 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "MSI MAG X670E Tomahawk WiFi", psuName: "Corsair RM850e 850W", caseName: "Corsair 5000D Airflow", coolerName: "Noctua NH-D15 G2", notes: "Latest-generation 16GB NVIDIA option for buyers who want Blackwell features, GDDR7 bandwidth, and CUDA compatibility. Good for 13B-34B quantized inference, but still not a replacement for 24GB+ VRAM builds.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
-    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "RTX 3090 Used Value Build", targetModel: "34B q4 / 70B offload", ramGb: 64, storageGb: 2000, estimatedPriceEur: 1699, bestFor: "Used RTX 3090 with 24GB VRAM at discounted pricing", estimatedTokensPerSec: "10-18 t/s (34B q4)", estimatedSystemPowerW: 450, recommendedPsuW: 850, coolingProfile: "Budget tower cooling", cpuName: "AMD Ryzen 7 9700X", gpuName: "NVIDIA RTX 3090", ramName: "Corsair Vengeance 64GB (2x32GB) DDR5-6000 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "ASUS TUF Gaming X670E-PLUS WiFi", psuName: "SeaSonic Focus GX-850 850W", caseName: "Fractal Design Pop Air", coolerName: "Thermalright Phantom Spirit 120 EVO", notes: "Used-market value build centered on 24GB of CUDA VRAM. Excellent for 34B quantized models and larger offload experiments, but used GPU condition, thermals, and warranty should be checked carefully.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
-    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Power-Efficient RTX 4000 Ada Build", targetModel: "13B q4", ramGb: 64, storageGb: 2000, estimatedPriceEur: 2459, bestFor: "Low-power 20GB pro card for always-on inference server", estimatedTokensPerSec: "12-20 t/s (13B q4)", estimatedSystemPowerW: 250, recommendedPsuW: 550, coolingProfile: "Quiet air cooling, low TDP", cpuName: "AMD Ryzen 9 7900", gpuName: "NVIDIA RTX 4000 Ada", ramName: "G.Skill Flare X5 64GB (2x32GB) DDR5-5600 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "Corsair RM750e 750W", caseName: "Fractal Design North", coolerName: "be quiet! Dark Rock Pro 5", notes: "Quiet, efficient always-on inference box with a 20GB professional NVIDIA GPU. Best for homelab serving, private assistants, and low-noise office use where power draw matters more than peak gaming performance.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
-    { profileKey: "llm-finetune-starter", profileLabel: "LLM Fine-Tune Starter", buildName: "16GB VRAM Fine-Tune Workhorse", targetModel: "7B-13B LoRA/QLoRA", ramGb: 96, storageGb: 4000, estimatedPriceEur: 2749, bestFor: "Serious LoRA fine-tuning with 16GB VRAM and 96GB system RAM", estimatedTokensPerSec: "Training: varies by batch size", estimatedSystemPowerW: 400, recommendedPsuW: 850, coolingProfile: "Premium dual-tower air cooling", cpuName: "AMD Ryzen 9 9950X", gpuName: "NVIDIA RTX 4070 Ti SUPER", ramName: "G.Skill Trident Z5 RGB 96GB (2x48GB) DDR5-6400 CL32", storageName: "Samsung 990 Pro 4TB", mbName: "ASUS ROG Crosshair X670E Hero", psuName: "SeaSonic Focus GX-850 850W", caseName: "Fractal Design Meshify 2", coolerName: "Noctua NH-D15 G2", notes: "More serious 7B-13B LoRA/QLoRA workstation with CUDA, 96GB RAM, and 4TB fast storage for datasets and checkpoints. It is still a single 16GB GPU, so training plans should stay adapter-based.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
-    { profileKey: "hybrid-ai-gaming", profileLabel: "Hybrid AI + Gaming", buildName: "5090 Blackwell Hybrid", targetModel: "70B q4 + 4K gaming", ramGb: 64, storageGb: 4000, estimatedPriceEur: 4199, bestFor: "Flagship Blackwell for 4K gaming and large-model inference", estimatedTokensPerSec: "12-22 t/s (70B q4)", estimatedSystemPowerW: 750, recommendedPsuW: 1200, coolingProfile: "360mm AIO for sustained dual-use loads", cpuName: "Intel Core Ultra 9 285K", gpuName: "NVIDIA RTX 5090", ramName: "Corsair Dominator Titanium 64GB (2x32GB) DDR5-6600 CL32", storageName: "Samsung 990 Pro 4TB", mbName: "ASUS ROG Maximus Z890 Hero", psuName: "Corsair HX1200i 1200W", caseName: "Lian Li O11 Dynamic EVO", coolerName: "Arctic Liquid Freezer III 360", notes: "Flagship hybrid for buyers who want top-tier 4K gaming and local large-model inference in one tower. The 32GB Blackwell GPU gives more AI headroom than 24GB cards, but it needs strong cooling and power planning.", sourceRefs: "nvidia.com, intel.com", compatNotes: "" },
-    { profileKey: "hybrid-ai-gaming", profileLabel: "Hybrid AI + Gaming", buildName: "Budget 16GB AI + Gaming", targetModel: "13B q4 + 1080p gaming", ramGb: 32, storageGb: 2000, estimatedPriceEur: 1049, bestFor: "Budget 16GB card for light AI and 1080p gaming", estimatedTokensPerSec: "8-14 t/s (13B q4)", estimatedSystemPowerW: 300, recommendedPsuW: 650, coolingProfile: "Budget tower cooling", cpuName: "AMD Ryzen 5 7600", gpuName: "AMD Radeon RX 7600 XT", ramName: "Kingston Fury Beast 32GB (2x16GB) DDR5-6000 CL36", storageName: "WD Black SN850X 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "SeaSonic Focus GX-650 650W", caseName: "Corsair 4000D Airflow", coolerName: "DeepCool AK620", notes: "Low-cost dual-use build for 1080p gaming and light local AI. The 16GB AMD card gives useful VRAM for quantized models, but software compatibility is more selective than on CUDA.", sourceRefs: "amd.com", compatNotes: "" },
-    { profileKey: "workstation-ai", profileLabel: "AI Workstation", buildName: "32/48GB Pro Workstation", targetModel: "70B q4", ramGb: 256, storageGb: 4000, estimatedPriceEur: 10999, bestFor: "48GB pro GPU workstation for sustained multi-model serving", estimatedTokensPerSec: "8-15 t/s (70B q4)", estimatedSystemPowerW: 750, recommendedPsuW: 1600, coolingProfile: "Workstation 420mm AIO", cpuName: "AMD Threadripper 7970X", gpuName: "AMD Radeon PRO W7900", ramName: "Kingston Server Premier 256GB (4x64GB) DDR5-4800 ECC RDIMM", storageName: "Samsung 990 Pro 4TB", mbName: "ASUS Pro WS WRX90E-SAGE SE", psuName: "be quiet! Dark Power Pro 13 1600W", caseName: "Phanteks Enthoo Pro 2", coolerName: "Arctic Liquid Freezer III 420", notes: "AMD professional workstation path with 48GB VRAM and 256GB ECC RAM for large ROCm-friendly workloads. Good for teams standardizing on AMD, but CUDA-first software should be validated before purchase.", sourceRefs: "amd.com", compatNotes: "" },
-    { profileKey: "workstation-ai", profileLabel: "AI Workstation", buildName: "Software Developer AI Workstation", targetModel: "34B q4", ramGb: 128, storageGb: 4000, estimatedPriceEur: 3849, bestFor: "Developer workstation with 24GB VRAM for inference + IDE + containers", estimatedTokensPerSec: "10-18 t/s (34B q4)", estimatedSystemPowerW: 500, recommendedPsuW: 1000, coolingProfile: "Quiet 360mm AIO", cpuName: "AMD Ryzen 9 9950X", gpuName: "NVIDIA RTX 4090", ramName: "Corsair Vengeance 128GB (4x32GB) DDR5-5600 CL40", storageName: "Samsung 990 Pro 4TB", mbName: "MSI MAG X670E Tomahawk WiFi", psuName: "SeaSonic Focus GX-1000 1000W", caseName: "Fractal Design Define 7 XL", coolerName: "Arctic Liquid Freezer III 360", notes: "Developer-first workstation for local models, IDEs, containers, databases, and browser-heavy workflows running at the same time. The 24GB CUDA GPU covers serious inference while 128GB RAM keeps the rest of the workspace smooth.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
-    { profileKey: "homelab-ai", profileLabel: "Homelab AI", buildName: "Homelab Inference Server", targetModel: "34B q4", ramGb: 96, storageGb: 4000, estimatedPriceEur: 1949, bestFor: "Always-on homelab inference server with headless operation", estimatedTokensPerSec: "10-18 t/s (34B q4)", estimatedSystemPowerW: 350, recommendedPsuW: 850, coolingProfile: "Quiet tower cooling for 24/7 operation", cpuName: "AMD Ryzen 9 7900", gpuName: "NVIDIA RTX 4070 Ti SUPER", ramName: "Corsair Vengeance 96GB (2x48GB) DDR5-5600 CL40", storageName: "Samsung 990 Pro 4TB", mbName: "ASUS TUF Gaming X670E-PLUS WiFi", psuName: "SeaSonic Focus GX-850 850W", caseName: "Fractal Design Define 7 XL", coolerName: "Noctua NH-D15 G2", notes: "Quiet headless server for Ollama, Open WebUI, embeddings, and small internal AI services. Prioritizes 24/7 stability, storage, and RAM over gaming aesthetics.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
-    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Estonian Value 16GB Build", targetModel: "13B q4", ramGb: 64, storageGb: 2000, estimatedPriceEur: 1399, bestFor: "Best-value build using widely available Estonian market components", estimatedTokensPerSec: "12-20 t/s (13B q4)", estimatedSystemPowerW: 300, recommendedPsuW: 750, coolingProfile: "Budget air cooling", cpuName: "AMD Ryzen 5 9600X", gpuName: "NVIDIA RTX 4060 Ti 16GB", ramName: "Corsair Vengeance 64GB (2x32GB) DDR5-6000 CL30", storageName: "Kingston KC3000 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "SeaSonic Focus GX-750 750W", caseName: "Fractal Design Pop Air", coolerName: "DeepCool AK620", notes: "Value build selected around parts that are easier to source from Estonian retailers. Good first serious local AI machine for 7B-13B models, RAG, and coding assistants without overbuying flagship hardware.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "24GB CUDA Inference Workstation", targetModel: "34B q4 / 70B offload", ramGb: 128, storageGb: 4000, estimatedPriceEur: 6396, bestFor: "Serious local inference with 24GB CUDA VRAM and heavy multitasking", estimatedTokensPerSec: "10-18 t/s (34B q4)", estimatedSystemPowerW: 620, recommendedPsuW: 1000, coolingProfile: "High-airflow tower with 360mm AIO", cpuName: "AMD Ryzen 9 7950X", gpuName: "NVIDIA RTX 4090", ramName: "Corsair Vengeance 128GB (4x32GB) DDR5-5600 CL40", storageName: "Samsung 990 Pro 4TB", mbName: "MSI MAG X670E Tomahawk WiFi", psuName: "SeaSonic Focus GX-1000 1000W", caseName: "Fractal Design Torrent", coolerName: "Arctic Liquid Freezer III 360", notes: "Strong consumer CUDA box for 13B-34B models, coding assistants, embeddings, and larger offload experiments. 70B-class use requires careful quantization, context settings, and realistic throughput expectations because the GPU has 24GB VRAM.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Balanced NVIDIA 16GB", targetModel: "13B-30B q4", ramGb: 64, storageGb: 2000, estimatedPriceEur: 4050, bestFor: "Fast 16GB CUDA inference, coding assistants, and creator workloads", estimatedTokensPerSec: "15-25 t/s (13B q4)", estimatedSystemPowerW: 450, recommendedPsuW: 1000, coolingProfile: "Quiet air cooling with premium dual-tower", cpuName: "AMD Ryzen 9 7900", gpuName: "NVIDIA RTX 4080 SUPER", ramName: "Corsair Vengeance 64GB (2x32GB) DDR5-6000 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "Corsair RM1000e 1000W", caseName: "Corsair 5000D Airflow", coolerName: "Noctua NH-D15 G2", notes: "Balanced CUDA choice for local chat, coding assistants, embeddings, and 13B-class models. Some 30B-34B quantized workloads are possible with tight context or CPU offload, but 16GB VRAM is the main limiter.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Radeon 24GB ROCm Validation Build", targetModel: "13B-34B q4 ROCm", ramGb: 96, storageGb: 2000, estimatedPriceEur: 3970, bestFor: "24GB AMD inference when the target ROCm stack is pre-validated", estimatedTokensPerSec: "10-18 t/s (13B-34B q4, ROCm)", estimatedSystemPowerW: 500, recommendedPsuW: 1000, coolingProfile: "Balanced air cooling", cpuName: "Intel Core i7-14700K", gpuName: "AMD Radeon RX 7900 XTX", ramName: "Corsair Vengeance 96GB (2x48GB) DDR5-5600 CL40", storageName: "Samsung 990 Pro 2TB", mbName: "MSI MPG Z790 Carbon WiFi", psuName: "Corsair RM1000e 1000W", caseName: "Fractal Design Meshify 2", coolerName: "be quiet! Dark Rock Pro 5", notes: "Good VRAM-per-euro only for buyers who have validated the exact ROCm/PyTorch/Ollama stack they plan to run. CUDA-first tools, training recipes, and plugins should be assumed NVIDIA-first unless tested.", sourceRefs: "amd.com, intel.com", compatNotes: "" },
+    { profileKey: "llm-finetune-starter", profileLabel: "LLM Fine-Tune Starter", buildName: "CUDA Adapter-Tuning Starter", targetModel: "7B-13B LoRA", ramGb: 96, storageGb: 2000, estimatedPriceEur: 3636, bestFor: "LoRA/QLoRA experiments on 7B-13B models with CUDA compatibility", estimatedTokensPerSec: "Training: varies by batch size", estimatedSystemPowerW: 390, recommendedPsuW: 850, coolingProfile: "Value dual-tower air cooling for sustained loads", cpuName: "AMD Ryzen 9 7900", gpuName: "NVIDIA RTX 4070 Ti SUPER", ramName: "G.Skill Trident Z5 RGB 96GB (2x48GB) DDR5-6400 CL32", storageName: "Samsung 990 Pro 2TB", mbName: "MSI MAG X670E Tomahawk WiFi", psuName: "SeaSonic Focus GX-850 850W", caseName: "Fractal Design North", coolerName: "Thermalright Phantom Spirit 120 EVO", notes: "Starter tuning build for LoRA and QLoRA experiments where CUDA compatibility matters. Budget is kept on GPU, RAM, and storage instead of an oversized motherboard; the 16GB GPU still keeps training plans adapter-based.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "llm-finetune-starter", profileLabel: "LLM Fine-Tune Starter", buildName: "Budget Fine-Tune Entry", targetModel: "7B LoRA / embeddings", ramGb: 64, storageGb: 2000, estimatedPriceEur: 2401, bestFor: "Entry-level LoRA, embeddings, and RAG pipeline learning", estimatedTokensPerSec: "Training: varies by batch size", estimatedSystemPowerW: 260, recommendedPsuW: 750, coolingProfile: "Budget air cooling", cpuName: "AMD Ryzen 5 7600", gpuName: "NVIDIA RTX 4060 Ti 16GB", ramName: "G.Skill Flare X5 64GB (2x32GB) DDR5-5600 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "SeaSonic Focus GX-750 750W", caseName: "Fractal Design Pop Air", coolerName: "Thermalright Phantom Spirit 120 SE", notes: "Entry point for learning fine-tuning, embeddings, RAG pipelines, and small-batch experiments. The 16GB VRAM is useful, but the narrow memory bus makes this a learning machine rather than a high-throughput trainer.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "hybrid-ai-gaming", profileLabel: "Hybrid AI + Gaming", buildName: "4K Hybrid Performance", targetModel: "13B-30B q4 + 4K gaming", ramGb: 64, storageGb: 2000, estimatedPriceEur: 4545, bestFor: "One machine for 4K gaming, creator apps, and local AI", estimatedTokensPerSec: "15-25 t/s (13B q4)", estimatedSystemPowerW: 500, recommendedPsuW: 1000, coolingProfile: "AIO liquid cooling for quiet dual-use", cpuName: "Intel Core i9-14900K", gpuName: "NVIDIA RTX 4080 SUPER", ramName: "Corsair Dominator Titanium 64GB (2x32GB) DDR5-6600 CL32", storageName: "Samsung 990 Pro 2TB", mbName: "ASUS ROG Strix Z790-F Gaming WiFi", psuName: "Corsair RM1000e 1000W", caseName: "Lian Li O11 Dynamic EVO", coolerName: "Arctic Liquid Freezer III 280", notes: "Built for serious 4K gaming, creator apps, and local AI in one tower. The 16GB GPU is excellent for 13B-class inference, but it should not be positioned as a full 70B local box.", sourceRefs: "nvidia.com, intel.com", compatNotes: "" },
+    { profileKey: "hybrid-ai-gaming", profileLabel: "Hybrid AI + Gaming", buildName: "1440p AI Creator", targetModel: "13B-30B q4 + high refresh", ramGb: 64, storageGb: 2000, estimatedPriceEur: 3199, bestFor: "1440p high-refresh gaming and 13B-class local inference", estimatedTokensPerSec: "12-20 t/s (13B q4)", estimatedSystemPowerW: 420, recommendedPsuW: 850, coolingProfile: "Compact AIO liquid cooling", cpuName: "Intel Core i7-14700K", gpuName: "NVIDIA RTX 4070 Ti SUPER", ramName: "Kingston Fury Renegade 64GB (2x32GB) DDR5-6000 CL32", storageName: "Samsung 990 Pro 2TB", mbName: "Gigabyte Z790 AORUS Elite AX", psuName: "Corsair RM850e 850W", caseName: "NZXT H7 Flow", coolerName: "Arctic Liquid Freezer III 240", notes: "Practical sweet spot for 1440p gaming, streaming, content creation, and local AI experiments. The 16GB CUDA GPU is the reason to choose it over cheaper gaming-first systems; larger models need tight quantization or offload.", sourceRefs: "nvidia.com, intel.com", compatNotes: "" },
+    { profileKey: "workstation-ai", profileLabel: "AI Workstation", buildName: "Threadripper 48GB Pro Workstation", targetModel: "70B q4 sustained", ramGb: 256, storageGb: 4000, estimatedPriceEur: 16286, bestFor: "Sustained 70B inference and workstation AI workloads", estimatedTokensPerSec: "8-15 t/s (70B q4)", estimatedSystemPowerW: 750, recommendedPsuW: 1600, coolingProfile: "Workstation-grade 420mm AIO cooling", cpuName: "AMD Threadripper 7960X", gpuName: "NVIDIA RTX 6000 Ada", ramName: "Kingston Server Premier 256GB (4x64GB) DDR5-4800 ECC RDIMM", storageName: "Samsung 990 Pro 4TB", mbName: "ASUS Pro WS WRX90E-SAGE SE", psuName: "be quiet! Dark Power Pro 13 1600W", caseName: "Phanteks Enthoo Pro 2", coolerName: "Arctic Liquid Freezer III 420", notes: "Professional single-GPU workstation for sustained 70B-class inference, large context windows, and heavy multitasking. The 48GB RTX 6000 Ada is the key upgrade: more VRAM, workstation thermals, and better fit for long unattended jobs.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "multi-gpu-ai", profileLabel: "High-Memory AI Server", buildName: "RTX 6000 Ada Team Server", targetModel: "70B+ single-GPU inference", ramGb: 512, storageGb: 8000, estimatedPriceEur: 23140, bestFor: "Single-GPU 48GB inference, model serving, and large system-RAM workloads", estimatedTokensPerSec: "Varies by model/runtime", estimatedSystemPowerW: 850, recommendedPsuW: 1600, coolingProfile: "High-memory workstation cooling with 420mm AIO", cpuName: "AMD Threadripper PRO 7975WX", gpuName: "NVIDIA RTX 6000 Ada", ramName: "Kingston Server Premier 512GB (8x64GB) DDR5-4800 ECC RDIMM", storageName: "WD Black SN850X 8TB", mbName: "ASUS Pro WS WRX90E-SAGE SE", psuName: "be quiet! Dark Power Pro 13 1600W", caseName: "Phanteks Enthoo Pro 2", coolerName: "Arctic Liquid Freezer III 420", notes: "High-memory team server built around one RTX 6000 Ada. Custom multi-GPU systems require a separate quote because this catalog schema prices one GPU per build and should not imply two cards are included.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Efficient 12GB CUDA Workstation", targetModel: "7B-13B q4 / 20B tight", ramGb: 64, storageGb: 2000, estimatedPriceEur: 2716, bestFor: "Efficient CUDA inference, coding assistants, and private chat", estimatedTokensPerSec: "12-25 t/s (7B-13B q4)", estimatedSystemPowerW: 350, recommendedPsuW: 750, coolingProfile: "Budget tower air cooling", cpuName: "Intel Core i5-14600K", gpuName: "NVIDIA RTX 4070 SUPER", ramName: "Corsair Vengeance 64GB (2x32GB) DDR5-6000 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "ASRock Z790 Pro RS", psuName: "SeaSonic Focus GX-750 750W", caseName: "Corsair 4000D Airflow", coolerName: "Thermalright Phantom Spirit 120 EVO", notes: "Efficient CUDA build for 7B-13B inference, coding assistants, and private chat without excessive heat or power draw. The 12GB VRAM is the limiter; 20B-class models require aggressive quantization and short context.", sourceRefs: "nvidia.com, intel.com", compatNotes: "" },
+    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "AMD 16GB ROCm Value Build", targetModel: "13B q4 / 20B tight", ramGb: 64, storageGb: 2000, estimatedPriceEur: 2233, bestFor: "Value 16GB VRAM ROCm inference after stack validation", estimatedTokensPerSec: "12-20 t/s (13B q4, ROCm)", estimatedSystemPowerW: 310, recommendedPsuW: 750, coolingProfile: "Budget air cooling", cpuName: "AMD Ryzen 5 7600", gpuName: "AMD Radeon RX 7800 XT", ramName: "Kingston Fury Beast 64GB (2x32GB) DDR5-5200 CL40", storageName: "WD Black SN850X 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "SeaSonic Focus GX-750 750W", caseName: "Corsair 4000D Airflow", coolerName: "DeepCool AK620", notes: "Value-focused AMD inference build with enough VRAM for useful 13B work and some 20B quantized experiments. Best when the target stack supports ROCm; choose NVIDIA if CUDA-only libraries are required.", sourceRefs: "amd.com", compatNotes: "" },
+    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Entry 12GB CUDA Build", targetModel: "7B q4 / 13B tight", ramGb: 32, storageGb: 2000, estimatedPriceEur: 1803, bestFor: "Entry CUDA inference for learning local AI workflows", estimatedTokensPerSec: "10-15 t/s (7B q4)", estimatedSystemPowerW: 250, recommendedPsuW: 650, coolingProfile: "Budget air cooling", cpuName: "AMD Ryzen 5 7600", gpuName: "NVIDIA RTX 3060 12GB", ramName: "Kingston Fury Beast 32GB (2x16GB) DDR5-6000 CL36", storageName: "WD Black SN850X 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "SeaSonic Focus GX-650 650W", caseName: "Corsair 4000D Airflow", coolerName: "Thermalright Phantom Spirit 120 SE", notes: "Lowest-cost sensible CUDA entry for local AI. Good for 7B quantized chat, embeddings, and learning Ollama or llama.cpp; 13B models need tight quantization and shorter context.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Blackwell 5070 Ti 16GB Build", targetModel: "13B-30B q4", ramGb: 64, storageGb: 2000, estimatedPriceEur: 3556, bestFor: "Latest-gen Blackwell 16GB with GDDR7 bandwidth for efficient inference", estimatedTokensPerSec: "15-25 t/s (13B q4)", estimatedSystemPowerW: 450, recommendedPsuW: 850, coolingProfile: "Premium air cooling", cpuName: "AMD Ryzen 9 9900X", gpuName: "NVIDIA RTX 5070 Ti", ramName: "Corsair Vengeance 64GB (2x32GB) DDR5-6000 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "MSI MAG X670E Tomahawk WiFi", psuName: "Corsair RM850e 850W", caseName: "Corsair 5000D Airflow", coolerName: "Noctua NH-D15 G2", notes: "Latest-generation 16GB NVIDIA option for buyers who want Blackwell features, GDDR7 bandwidth, and CUDA compatibility. Good for 13B-class inference, but still not a replacement for 24GB+ VRAM builds.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Power-Efficient RTX 4000 Ada Build", targetModel: "13B-30B q4", ramGb: 64, storageGb: 2000, estimatedPriceEur: 3291, bestFor: "Low-power 20GB pro card for always-on inference server", estimatedTokensPerSec: "12-20 t/s (13B q4)", estimatedSystemPowerW: 250, recommendedPsuW: 750, coolingProfile: "Quiet air cooling, low TDP", cpuName: "AMD Ryzen 9 7900", gpuName: "NVIDIA RTX 4000 Ada", ramName: "G.Skill Flare X5 64GB (2x32GB) DDR5-5600 CL30", storageName: "Samsung 990 Pro 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "Corsair RM750e 750W", caseName: "Fractal Design North", coolerName: "be quiet! Dark Rock Pro 5", notes: "Quiet, efficient always-on inference box with a 20GB professional NVIDIA GPU. Best for homelab serving, private assistants, and low-noise office use where power draw matters more than peak gaming performance.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "llm-finetune-starter", profileLabel: "LLM Fine-Tune Starter", buildName: "16GB VRAM Fine-Tune Workhorse", targetModel: "7B-13B LoRA/QLoRA", ramGb: 96, storageGb: 4000, estimatedPriceEur: 4257, bestFor: "Serious LoRA fine-tuning with 16GB VRAM and 96GB system RAM", estimatedTokensPerSec: "Training: varies by batch size", estimatedSystemPowerW: 400, recommendedPsuW: 850, coolingProfile: "Premium dual-tower air cooling", cpuName: "AMD Ryzen 9 9950X", gpuName: "NVIDIA RTX 4070 Ti SUPER", ramName: "G.Skill Trident Z5 RGB 96GB (2x48GB) DDR5-6400 CL32", storageName: "Samsung 990 Pro 4TB", mbName: "MSI MAG X670E Tomahawk WiFi", psuName: "SeaSonic Focus GX-850 850W", caseName: "Fractal Design Meshify 2", coolerName: "Noctua NH-D15 G2", notes: "Serious 7B-13B LoRA/QLoRA workstation with CUDA, 96GB RAM, and 4TB fast storage for datasets and checkpoints. The board is sized for reliability rather than prestige; the single 16GB GPU keeps training plans adapter-based.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "hybrid-ai-gaming", profileLabel: "Hybrid AI + Gaming", buildName: "5090 Blackwell Hybrid", targetModel: "70B q4 + 4K gaming", ramGb: 64, storageGb: 4000, estimatedPriceEur: 8409, bestFor: "Flagship Blackwell for 4K gaming and larger local-model experiments", estimatedTokensPerSec: "12-22 t/s (70B q4)", estimatedSystemPowerW: 750, recommendedPsuW: 1200, coolingProfile: "360mm AIO for sustained dual-use loads", cpuName: "Intel Core Ultra 9 285K", gpuName: "NVIDIA RTX 5090", ramName: "Corsair Dominator Titanium 64GB (2x32GB) DDR5-6600 CL32", storageName: "Samsung 990 Pro 4TB", mbName: "ASUS ROG Maximus Z890 Hero", psuName: "Corsair HX1200i 1200W", caseName: "Lian Li O11 Dynamic EVO", coolerName: "Arctic Liquid Freezer III 360", notes: "Flagship hybrid for buyers who want top-tier 4K gaming and local large-model inference in one tower. The 32GB Blackwell GPU gives more AI headroom than 24GB cards, but this should stay quote-led when pricing or availability is thin.", sourceRefs: "nvidia.com, intel.com", compatNotes: "" },
+    { profileKey: "hybrid-ai-gaming", profileLabel: "Hybrid AI + Gaming", buildName: "Light 16GB AI + 1080p Gaming", targetModel: "7B-13B q4 + 1080p gaming", ramGb: 32, storageGb: 2000, estimatedPriceEur: 1826, bestFor: "Light local AI and 1080p gaming on a 16GB AMD card", estimatedTokensPerSec: "8-14 t/s (13B q4)", estimatedSystemPowerW: 280, recommendedPsuW: 650, coolingProfile: "Budget tower cooling", cpuName: "AMD Ryzen 5 7600", gpuName: "AMD Radeon RX 7600 XT", ramName: "Kingston Fury Beast 32GB (2x16GB) DDR5-6000 CL36", storageName: "WD Black SN850X 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "SeaSonic Focus GX-650 650W", caseName: "Fractal Design Pop Air", coolerName: "Thermalright Phantom Spirit 120 SE", notes: "Low-cost dual-use build for 1080p gaming and light local AI. The 16GB AMD card gives useful VRAM for quantized models, but software compatibility is more selective than on CUDA.", sourceRefs: "amd.com", compatNotes: "" },
+    { profileKey: "workstation-ai", profileLabel: "AI Workstation", buildName: "Radeon PRO W7900 48GB Workstation", targetModel: "70B q4 ROCm-validated", ramGb: 256, storageGb: 4000, estimatedPriceEur: 14331, bestFor: "48GB AMD pro GPU workstation for ROCm-friendly workloads", estimatedTokensPerSec: "8-15 t/s (70B q4)", estimatedSystemPowerW: 750, recommendedPsuW: 1600, coolingProfile: "Workstation 420mm AIO", cpuName: "AMD Threadripper 7970X", gpuName: "AMD Radeon PRO W7900", ramName: "Kingston Server Premier 256GB (4x64GB) DDR5-4800 ECC RDIMM", storageName: "Samsung 990 Pro 4TB", mbName: "ASUS Pro WS WRX90E-SAGE SE", psuName: "be quiet! Dark Power Pro 13 1600W", caseName: "Phanteks Enthoo Pro 2", coolerName: "Arctic Liquid Freezer III 420", notes: "AMD professional workstation path with 48GB VRAM and 256GB ECC RAM for large ROCm-friendly workloads. Good for teams standardizing on AMD, but CUDA-first software should be validated before purchase.", sourceRefs: "amd.com", compatNotes: "" },
+    { profileKey: "workstation-ai", profileLabel: "AI Workstation", buildName: "Software Developer AI Workstation", targetModel: "34B q4", ramGb: 128, storageGb: 4000, estimatedPriceEur: 6557, bestFor: "Developer workstation with 24GB VRAM for inference, IDEs, and containers", estimatedTokensPerSec: "10-18 t/s (34B q4)", estimatedSystemPowerW: 500, recommendedPsuW: 1000, coolingProfile: "Quiet 360mm AIO", cpuName: "AMD Ryzen 9 9950X", gpuName: "NVIDIA RTX 4090", ramName: "Corsair Vengeance 128GB (4x32GB) DDR5-5600 CL40", storageName: "Samsung 990 Pro 4TB", mbName: "MSI MAG X670E Tomahawk WiFi", psuName: "SeaSonic Focus GX-1000 1000W", caseName: "Fractal Design Define 7 XL", coolerName: "Arctic Liquid Freezer III 360", notes: "Developer-first workstation for local models, IDEs, containers, databases, and browser-heavy workflows running at the same time. The 24GB CUDA GPU covers serious inference while 128GB RAM keeps the rest of the workspace smooth.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "homelab-ai", profileLabel: "Homelab AI", buildName: "Homelab Inference Server", targetModel: "13B-34B q4", ramGb: 96, storageGb: 4000, estimatedPriceEur: 3579, bestFor: "Always-on homelab inference server with headless operation", estimatedTokensPerSec: "10-18 t/s (13B-34B q4)", estimatedSystemPowerW: 330, recommendedPsuW: 850, coolingProfile: "Airflow tower cooling for 24/7 operation", cpuName: "AMD Ryzen 9 7900", gpuName: "NVIDIA RTX 4070 Ti SUPER", ramName: "Crucial 96GB (2x48GB) DDR5-5600 CL46", storageName: "Samsung 990 Pro 4TB", mbName: "ASUS TUF Gaming X670E-PLUS WiFi", psuName: "SeaSonic Focus GX-850 850W", caseName: "Fractal Design Meshify 2", coolerName: "Thermalright Phantom Spirit 120 EVO", notes: "Quiet headless server for Ollama, Open WebUI, embeddings, and small internal AI services. Budget is focused on 16GB CUDA VRAM, 96GB RAM, and 4TB storage instead of oversized case or cooler spend.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
+    { profileKey: "local-llm-inference", profileLabel: "Local LLM Inference", buildName: "Estonian Value 16GB Build", targetModel: "7B-13B q4", ramGb: 64, storageGb: 2000, estimatedPriceEur: 2291, bestFor: "Best-value 16GB CUDA build using widely available Estonian-market parts", estimatedTokensPerSec: "12-20 t/s (13B q4)", estimatedSystemPowerW: 300, recommendedPsuW: 750, coolingProfile: "Budget air cooling", cpuName: "AMD Ryzen 5 9600X", gpuName: "NVIDIA RTX 4060 Ti 16GB", ramName: "G.Skill Flare X5 64GB (2x32GB) DDR5-5600 CL30", storageName: "Kingston KC3000 2TB", mbName: "Gigabyte B650 AORUS Elite AX", psuName: "SeaSonic Focus GX-750 750W", caseName: "Fractal Design Pop Air", coolerName: "DeepCool AK620", notes: "Value build selected around parts that are easier to source from Estonian retailers. Good first serious local AI machine for 7B-13B models, RAG, and coding assistants without overbuying flagship hardware.", sourceRefs: "nvidia.com, amd.com", compatNotes: "" },
   ];
 
   for (const b of builds) {
@@ -2203,4 +2364,22 @@ async function seedProfileBuilds(db: ReturnType<typeof getAdapter>): Promise<voi
       [b.profileKey, b.profileLabel, b.buildName, b.targetModel, b.ramGb, b.storageGb, b.estimatedPriceEur, b.bestFor, b.estimatedTokensPerSec, b.estimatedSystemPowerW, b.recommendedPsuW, b.coolingProfile, b.notes, b.sourceRefs, b.compatNotes, cpuId, gpuId, ramId, storageId, motherboardId, psuId, caseId, coolerId],
     );
   }
+
+  await db.execute(
+    `DELETE FROM profile_builds
+     WHERE build_name IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "Flagship 24GB CUDA Inference",
+      "24GB VRAM Value (ROCm path)",
+      "4K Hybrid Flagship",
+      "Threadripper 48GB Beast",
+      "Dual RTX 6000 Ada Tower",
+      "Efficient 20B Workstation",
+      "AMD Value 16GB Inference",
+      "Cheapest 12GB VRAM Build",
+      "RTX 3090 Used Value Build",
+      "Budget 16GB AI + Gaming",
+      "32/48GB Pro Workstation",
+    ],
+  );
 }
