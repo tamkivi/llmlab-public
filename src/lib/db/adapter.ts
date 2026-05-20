@@ -56,6 +56,8 @@ class SqliteAdapter implements DbAdapter {
     const dataDir = resolveDataDir();
     mkdirSync(dataDir, { recursive: true });
     this.db = new DatabaseSync(join(dataDir, "catalog.db"));
+    this.db.exec("PRAGMA busy_timeout = 30000;");
+    this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
   }
 
@@ -90,6 +92,14 @@ class SqliteAdapter implements DbAdapter {
     const expiresAtIso = new Date(now + 10 * 60_000).toISOString();
     const key = String(lockKey);
 
+    await this.execute(`
+      CREATE TABLE IF NOT EXISTS runtime_locks (
+        lock_key TEXT PRIMARY KEY,
+        locked_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      )
+    `);
+    await this.execute("CREATE INDEX IF NOT EXISTS idx_runtime_locks_expires_at ON runtime_locks(expires_at)");
     await this.execute("DELETE FROM runtime_locks WHERE expires_at <= ?", [nowIso]).catch(() => 0);
     try {
       await this.execute(

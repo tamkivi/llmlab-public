@@ -5,7 +5,10 @@ import { Masthead } from "@/components/masthead";
 import { PageNav } from "@/components/page-nav";
 import { QuoteRequestForm } from "@/components/quote-request-form";
 import { TrustLinksSection } from "@/components/trust-links-section";
-import { getMacEgpuBuildDetailView } from "@/lib/server/catalog-service";
+import {
+  getMacEgpuBuildDetailView,
+  listMacEgpuBuildDetailStaticParams,
+} from "@/lib/server/catalog-service";
 import { getRequestLanguage } from "@/lib/server/lang";
 import { JsonLd, pageMetadata, productJsonLd } from "@/lib/seo";
 import { workloadGuidance } from "@/lib/workload-guidance";
@@ -13,6 +16,13 @@ import { workloadGuidance } from "@/lib/workload-guidance";
 type MacEgpuBuildDetailParams = {
   params: Promise<{ id: string }>;
 };
+
+export const revalidate = 900;
+export const dynamicParams = true;
+
+export async function generateStaticParams() {
+  return listMacEgpuBuildDetailStaticParams();
+}
 
 async function resolveMacEgpuBuildFromParams(params: Promise<{ id: string }>) {
   const resolvedParams = await params;

@@ -5,6 +5,7 @@ type SafeLogFields = {
   level?: LogLevel;
   area?: string;
   requestId?: string | null;
+  stripeRequestId?: string | null;
   reason?: string | null;
   orderId?: number | null;
   stripeEventId?: string | null;
@@ -62,6 +63,7 @@ export function logEvent(fields: SafeLogFields): void {
 
   assignText("area", fields.area);
   assignText("requestId", fields.requestId);
+  assignText("stripeRequestId", fields.stripeRequestId);
   assignText("reason", fields.reason);
   assignText("stripeEventId", fields.stripeEventId);
   assignText("itemType", fields.itemType);

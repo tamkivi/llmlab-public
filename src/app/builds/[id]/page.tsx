@@ -10,7 +10,11 @@ import { BuyerTrustSection } from "@/components/buyer-trust-section";
 import { AssemblyQaChecklist } from "@/components/assembly-qa-checklist";
 import { TrustLinksSection } from "@/components/trust-links-section";
 import { PriceTransparencyBadges } from "@/components/price-transparency-badges";
-import { getBuildDetailView, getPriceHistoryView } from "@/lib/server/catalog-service";
+import {
+  getBuildDetailView,
+  getPriceHistoryRangesView,
+  listBuildDetailStaticParams,
+} from "@/lib/server/catalog-service";
 import { getRequestLanguage } from "@/lib/server/lang";
 import { JsonLd, pageMetadata, productJsonLd } from "@/lib/seo";
 import { workloadGuidance } from "@/lib/workload-guidance";
@@ -18,6 +22,13 @@ import { workloadGuidance } from "@/lib/workload-guidance";
 type BuildDetailParams = {
   params: Promise<{ id: string }>;
 };
+
+export const revalidate = 900;
+export const dynamicParams = true;
+
+export async function generateStaticParams() {
+  return listBuildDetailStaticParams();
+}
 
 async function resolveBuildFromParams(params: Promise<{ id: string }>) {
   const resolvedParams = await params;
@@ -59,6 +70,14 @@ export default async function BuildDetailPage({
     notFound();
   }
   const directCheckoutEligible = build.checkoutEligible === true;
+  const checkoutBlockerText = (reason: string) => {
+    if (reason === "fallback_pricing") return isEt ? "usaldusväärne turuhind puudub" : "trusted market price missing";
+    if (reason === "stale_pricing") return isEt ? "turuhind on aegunud" : "market price is stale";
+    if (reason === "pricing_unhealthy") return isEt ? "hind ei läbinud kontrolli" : "price failed safety checks";
+    if (reason === "out_of_stock") return isEt ? "saadavus vajab kinnitamist" : "availability needs confirmation";
+    if (reason === "missing_price") return isEt ? "hinnainfo puudub" : "pricing data is missing";
+    return isEt ? "vajab käsitsi pakkumist" : "manual quote required";
+  };
   const workloadFit = workloadGuidance({
     gpuVramGb: build.gpuVramGb,
     systemRamGb: build.ramGb,
@@ -74,11 +93,8 @@ export default async function BuildDetailPage({
           name: cp.name,
           orderPriceEur: cp.priceEur,
           marketAvgEur: cp.marketAvgEur,
-          ranges: {
-            "7d": await getPriceHistoryView(cp.category, cp.itemId, 7),
-            "30d": await getPriceHistoryView(cp.category, cp.itemId, 30),
-            "90d": await getPriceHistoryView(cp.category, cp.itemId, 90),
-          },
+          checkedAt: cp.checkedAt,
+          ranges: await getPriceHistoryRangesView(cp.category, cp.itemId),
         })),
       )
     : [];
@@ -259,9 +275,29 @@ export default async function BuildDetailPage({
             </p>
             <p className="mt-2 text-xs text-[color:var(--muted)]">
               {isEt
-                ? "Hinnagraafik näitab tellimuse hinnale vastavat ajalugu koos kokkupaneku juurdehindlusega."
-                : "Price chart shows order-equivalent history including assembly markup."}
+                ? "Hinnagraafik näitab Eesti turu keskmist enne kokkupaneku juurdehindlust."
+                : "Price chart shows Estonian market averages before assembly markup."}
             </p>
+            {!directCheckoutEligible && build.checkoutBlockers && build.checkoutBlockers.length > 0 ? (
+              <div className="mt-4 rounded-md border border-yellow-400/25 bg-yellow-400/5 p-3 text-xs text-yellow-100">
+                <p className="font-semibold">
+                  {isEt ? "Otsekassa blokeerija" : "Direct checkout blocker"}
+                </p>
+                {build.checkoutBlockers.map((blocker) => {
+                  const component = build.componentPrices?.find((cp) => cp.label === blocker.label);
+                  return (
+                    <p key={`${blocker.label}:${blocker.itemId}`} className="mt-1">
+                      {blocker.label}: {component?.name ?? `${blocker.category}:${blocker.itemId}`} - {checkoutBlockerText(blocker.reason)}
+                    </p>
+                  );
+                })}
+              </div>
+            ) : null}
+            {!directCheckoutEligible && build.checkoutDisabledReason === "order_limit_exceeded" && build.checkoutMaxOrderEur ? (
+              <p className="mt-3 text-xs text-[color:var(--muted)]">
+                {isEt ? "Veebimakse limiit" : "Online checkout limit"}: €{build.checkoutMaxOrderEur.toLocaleString()}
+              </p>
+            ) : null}
             {build.componentTotalEur && build.componentTotalEur > 0 ? (
               <PurchaseBuildButton
                 itemType="profile_build"
@@ -271,6 +307,7 @@ export default async function BuildDetailPage({
                 lang={lang}
                 checkoutAvailable={directCheckoutEligible}
                 checkoutUnavailableReason={build.checkoutDisabledReason}
+                checkoutMaxOrderEur={build.checkoutMaxOrderEur}
               />
             ) : (
               <p className="mt-3 text-xs text-yellow-400">

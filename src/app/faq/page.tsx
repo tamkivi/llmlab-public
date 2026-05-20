@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { Masthead } from "@/components/masthead";
 import { PageNav } from "@/components/page-nav";
-import { ProfilePickerQuiz } from "@/components/profile-picker-quiz";
+import { ProfileRecommendationQuiz } from "@/components/profile-recommendation-quiz";
 import { getRequestLanguage } from "@/lib/server/lang";
 import { JsonLd, absoluteUrl, pageMetadata } from "@/lib/seo";
 
@@ -333,7 +333,7 @@ export default async function FaqPage() {
             <h2 className="font-display text-3xl font-semibold mb-5">
               {lang === "et" ? "Milline profiil sobib mulle?" : "Which one should I pick?"}
             </h2>
-            <ProfilePickerQuiz lang={lang} />
+            <ProfileRecommendationQuiz lang={lang} />
           </section>
         </div>
 

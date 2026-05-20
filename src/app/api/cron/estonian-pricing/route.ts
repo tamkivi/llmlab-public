@@ -3,6 +3,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { getAdapter, initDb } from "@/lib/db";
 import { refreshEstonianMarketPricing } from "@/lib/server/estonian-pricing-service";
 import type { RefreshSummary } from "@/lib/server/estonian-pricing-service";
+import { revalidatePublicPricingCaches } from "@/lib/server/public-cache-invalidation";
 import { logEvent, requestIdFromHeaders, safeErrorReason } from "@/lib/server/structured-log";
 
 export const runtime = "nodejs";
@@ -100,6 +101,9 @@ export async function GET(request: Request) {
         requestId,
       });
       const summary = await refreshEstonianMarketPricing();
+      const cacheInvalidation = summary.updated > 0 || summary.historyRowsInserted + summary.historyRowsUpdated > 0
+        ? revalidatePublicPricingCaches()
+        : null;
       const responseBody = pricingCronResponseBody(summary);
       logEvent({
         level: summary.status === "SUCCESS" ? "info" : "warn",
@@ -109,9 +113,9 @@ export async function GET(request: Request) {
         status: responseBody.status,
         count: summary.checked,
         durationMs: Date.now() - startedAt,
-        reason: `updated=${summary.updated} skipped=${summary.skipped} failed=${summary.failed} history=${summary.historyRowsInserted + summary.historyRowsUpdated} stale=${summary.staleCount}`,
+        reason: `updated=${summary.updated} skipped=${summary.skipped} failed=${summary.failed} history=${summary.historyRowsInserted + summary.historyRowsUpdated} stale=${summary.staleCount} revalidated=${cacheInvalidation?.tags.join("|") ?? "none"} failedRevalidate=${cacheInvalidation?.failedTags.join("|") ?? "none"}`,
       });
-      return NextResponse.json(responseBody, { status: pricingCronHttpStatus(summary) });
+      return NextResponse.json({ ...responseBody, cacheInvalidation }, { status: pricingCronHttpStatus(summary) });
     });
 
     if (!lock.acquired) {

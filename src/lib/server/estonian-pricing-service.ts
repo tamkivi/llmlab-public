@@ -15,7 +15,14 @@ import {
   upsertEstonianPriceCheck,
 } from "@/lib/db";
 import type { PriceTrackableCatalogItem } from "@/lib/db";
+import {
+  appendCategoryValidationSource,
+  categoryReferencePriceBounds,
+  validateRetailerCandidateForCategory,
+  type PricingValidationCategory,
+} from "@/lib/component-pricing-validation";
 import { ASSEMBLY_MARKUP_PCT, ASSEMBLY_MARKUP_MULTIPLIER } from "@/lib/pricing-constants";
+import { looksLikeRamCatalogName } from "@/lib/ram-pricing";
 
 /**
  * Estonian market price aggregator.
@@ -301,7 +308,8 @@ export type RetailerPriceCandidateDiagnostic = {
   requiredScore: number;
   accepted: boolean;
   missingRequiredTokens: string[];
-  rejectionReason: "accepted" | "below_token_threshold";
+  rejectionReason: "accepted" | "below_token_threshold" | "ram_spec_mismatch" | "category_spec_mismatch";
+  rejectionReasons: string[];
   contextSnippet?: string;
 };
 
@@ -328,6 +336,8 @@ export type RetailerSourceDiagnostic = {
     | "anti_bot"
     | "no_price_matches"
     | "all_prices_outside_ratio"
+    | "ram_spec_mismatch"
+    | "category_spec_mismatch"
     | "below_token_threshold";
 };
 
@@ -354,6 +364,7 @@ export type RetailerMatchDiagnostic = {
 };
 
 type RetailerDiagnosticOptions = {
+  category?: PricingValidationCategory;
   sources?: RetailerSource[];
   fetchHtml?: (source: RetailerSource) => Promise<FetchHtmlResult>;
   includeSnippets?: boolean;
@@ -380,6 +391,8 @@ function sourceRejectionReason(input: {
   priceMatchCount: number;
   inRatioCount: number;
   acceptedCount: number;
+  ramSpecMismatchCount: number;
+  categorySpecMismatchCount: number;
 }): RetailerSourceDiagnostic["rejectionReason"] {
   if (input.acceptedCount > 0) return "accepted";
   if (input.error) return "fetch_failed";
@@ -387,6 +400,8 @@ function sourceRejectionReason(input: {
   if (!input.ok || (input.status !== null && input.status >= 400)) return "http_error";
   if (input.priceMatchCount === 0) return "no_price_matches";
   if (input.inRatioCount === 0) return "all_prices_outside_ratio";
+  if (input.ramSpecMismatchCount > 0) return "ram_spec_mismatch";
+  if (input.categorySpecMismatchCount > 0) return "category_spec_mismatch";
   return "below_token_threshold";
 }
 
@@ -425,8 +440,10 @@ export async function diagnoseEstonianRetailerMatch(
 ): Promise<RetailerMatchDiagnostic> {
   const tokens = pricingProductTokens(query);
   const requiredScore = requiredRetailerTokenMatches(tokens);
-  const minPrice = basePrice * MIN_PRICE_RATIO;
-  const maxPrice = basePrice * MAX_PRICE_RATIO;
+  const validationCategory = options.category ?? (looksLikeRamCatalogName(query) ? "ram_kit" : null);
+  const categoryBounds = validationCategory ? categoryReferencePriceBounds(validationCategory, basePrice) : null;
+  const minPrice = categoryBounds?.min ?? basePrice * MIN_PRICE_RATIO;
+  const maxPrice = categoryBounds?.max ?? basePrice * MAX_PRICE_RATIO;
   const searchQuery = options.searchQuery ?? query;
   const sources = options.sources ?? ESTONIAN_RETAILER_SOURCES(searchQuery);
   const fetchHtml = options.fetchHtml ?? ((source: RetailerSource) => fetchWithTimeout(source.url));
@@ -443,14 +460,28 @@ export async function diagnoseEstonianRetailerMatch(
         const context = priceContext(fetched.html, index);
         const score = scoreRetailerProductContext(tokens, context);
         const missingRequiredTokens = missingRequiredModelTokens(tokens, context);
-        const accepted = score >= requiredScore && missingRequiredTokens.length === 0;
+        const categoryValidation = validateRetailerCandidateForCategory(validationCategory, query, context);
+        const rejectionReasons = [
+          ...(score >= requiredScore ? [] : ["below_token_threshold"]),
+          ...missingRequiredTokens.map((token) => `required_token_missing:${token}`),
+          ...categoryValidation.reasons,
+        ];
+        const accepted = rejectionReasons.length === 0;
+        const rejectionReason = accepted
+          ? "accepted" as const
+          : validationCategory === "ram_kit" && categoryValidation.reasons.length > 0
+            ? "ram_spec_mismatch" as const
+            : categoryValidation.reasons.length > 0
+              ? "category_spec_mismatch" as const
+            : "below_token_threshold" as const;
         return {
           price,
           score,
           requiredScore,
           accepted,
           missingRequiredTokens,
-          rejectionReason: accepted ? "accepted" as const : "below_token_threshold" as const,
+          rejectionReason,
+          rejectionReasons,
           contextSnippet: includeSnippets ? snippet(context, 260) : undefined,
         };
       })
@@ -482,6 +513,8 @@ export async function diagnoseEstonianRetailerMatch(
         priceMatchCount: priceMatches.length,
         inRatioCount: inRatio.length,
         acceptedCount: candidates.filter((candidate) => candidate.accepted).length,
+        ramSpecMismatchCount: candidates.filter((candidate) => candidate.rejectionReason === "ram_spec_mismatch").length,
+        categorySpecMismatchCount: candidates.filter((candidate) => candidate.rejectionReason === "category_spec_mismatch").length,
       }),
     };
   }));
@@ -542,9 +575,9 @@ export function retailerSearchQuery(name: string): string {
     .trim();
 }
 
-async function lookupPriceWithDiagnostics(query: string, basePrice: number): Promise<PriceLookupOutcome> {
+async function lookupPriceWithDiagnostics(category: PricingValidationCategory, query: string, basePrice: number): Promise<PriceLookupOutcome> {
   const searchQuery = retailerSearchQuery(query);
-  const diagnostic = await diagnoseEstonianRetailerMatch(query, basePrice, { searchQuery });
+  const diagnostic = await diagnoseEstonianRetailerMatch(query, basePrice, { category, searchQuery });
   const sourceReasonCounts = countByReason(diagnostic.sources.map((source) => source.rejectionReason));
   if (diagnostic.aggregate.averagePrice === null) {
     return {
@@ -559,7 +592,7 @@ async function lookupPriceWithDiagnostics(query: string, basePrice: number): Pro
     quote: {
       price: diagnostic.aggregate.averagePrice,
       sampleCount: diagnostic.aggregate.sampleCount,
-      sources: diagnostic.aggregate.sourcesSummary,
+      sources: appendCategoryValidationSource(category, diagnostic.aggregate.sourcesSummary),
     },
     reason: null,
     searchQuery,
@@ -689,14 +722,17 @@ export async function refreshEstonianMarketPricing(options: RefreshOptions = {})
 
   try {
     await runWithConcurrency(targets, concurrency, async (component) => {
+      const validationCategory = component.category as PricingValidationCategory;
       const lookup = fetchPrice
         ? {
-          quote: await fetchPrice(component.name, component.basePriceEur),
+          quote: await fetchPrice(component.name, component.basePriceEur).then((quote) => quote
+            ? { ...quote, sources: appendCategoryValidationSource(validationCategory, quote.sources) }
+            : null),
           reason: null,
           searchQuery: component.name,
           sourceReasonCounts: {},
         }
-        : await lookupPriceWithDiagnostics(component.name, component.basePriceEur);
+        : await lookupPriceWithDiagnostics(validationCategory, component.name, component.basePriceEur);
       let quote = lookup.quote;
       if (!quote) {
         const override = await getActiveAdminPricingOverride(component.category, component.itemId);

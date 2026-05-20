@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { Masthead } from "@/components/masthead";
 import { PageNav } from "@/components/page-nav";
+import { orderSupportHref } from "@/lib/order-ux";
 import { getRequestLanguage } from "@/lib/server/lang";
 
 export const metadata: Metadata = {
@@ -36,8 +37,11 @@ export default async function CheckoutCancelPage() {
             : "No payment was captured. You can return to the build page and start checkout again at any time."}
         </p>
 
-        <div className="mt-6">
+        <div className="mt-6 flex flex-wrap gap-3">
           <Link href="/" className="label-pill inline-block">{lang === "et" ? "Tagasi komplektide juurde" : "Back to builds"}</Link>
+          <a href={orderSupportHref()} className="label-pill inline-block">
+            {lang === "et" ? "Võta ühendust" : "Contact support"}
+          </a>
         </div>
       </section>
     </main>

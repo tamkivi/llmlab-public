@@ -15,6 +15,7 @@ type PriceGraphProps = {
   ranges: Record<RangeKey, PriceHistoryPoint[]>;
   preorderPriceEur: number | null;
   marketAvgEur: number | null;
+  checkedAt?: string | null;
   isQuoteProduct?: boolean;
   marketOnly?: boolean;
   lang?: SiteLanguage;
@@ -38,7 +39,14 @@ function cssVar(name: string, fallback: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
 }
 
-export function PriceGraph({ ranges, preorderPriceEur, marketAvgEur, isQuoteProduct, marketOnly = false, lang = "en" }: PriceGraphProps) {
+function currentMarketPoint(marketAvgEur: number | null, checkedAt?: string | null): PriceHistoryPoint[] {
+  if (marketAvgEur === null || !checkedAt) return [];
+  const date = checkedAt.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return [];
+  return [{ date, price: marketAvgEur }];
+}
+
+export function PriceGraph({ ranges, preorderPriceEur, marketAvgEur, checkedAt, isQuoteProduct, marketOnly = false, lang = "en" }: PriceGraphProps) {
   const accent = cssVar("--accent", "#3cb8a5");
   const grid = cssVar("--panel-border", "#2f3d4f");
   const isEt = lang === "et";
@@ -46,9 +54,11 @@ export function PriceGraph({ ranges, preorderPriceEur, marketAvgEur, isQuoteProd
   const [selectedRange, setSelectedRange] = useState<RangeKey>("30d");
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
-  const data = ranges[selectedRange];
-  const hasData = data.length > 0;
   const anyRangeHasData = ranges["7d"].length > 0 || ranges["30d"].length > 0 || ranges["90d"].length > 0;
+  const selectedRangeData = ranges[selectedRange];
+  const data = selectedRangeData.length > 0 ? selectedRangeData : currentMarketPoint(marketAvgEur, checkedAt);
+  const hasData = data.length > 0;
+  const usesCurrentOnly = hasData && !anyRangeHasData;
 
   const preorderEquiv = (price: number) => Math.round(price * ASSEMBLY_MARKUP_MULTIPLIER);
 
@@ -271,6 +281,14 @@ export function PriceGraph({ ranges, preorderPriceEur, marketAvgEur, isQuoteProd
           <span className="text-[color:var(--muted)]">
             {isEt ? "Koostamine + seadistus" : "Assembly + configuration"}: +{ASSEMBLY_MARKUP_PCT}%
           </span>
+        </div>
+      )}
+
+      {usesCurrentOnly && (
+        <div className="mb-3 rounded-lg border border-[color:var(--panel-border)] bg-[color:var(--panel)]/60 p-3 text-xs leading-5 text-[color:var(--muted)]">
+          {isEt
+            ? "Hinnaajalugu algab esimesest edukast hinnavärskendusest. Praegune komponendi hind on olemas, kuid trendi jaoks on vaja rohkem päevi."
+            : "Price history begins after the first successful pricing refresh. Current component pricing is available, but more historical data is needed to show a trend."}
         </div>
       )}
 

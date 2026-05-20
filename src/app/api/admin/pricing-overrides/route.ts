@@ -7,6 +7,7 @@ import {
 } from "@/lib/db";
 import { checkRateLimit, requestOriginIsAllowed } from "@/lib/request-utils";
 import { requireAdminAccess } from "@/lib/server/admin-auth";
+import { revalidatePublicPricingCaches } from "@/lib/server/public-cache-invalidation";
 import { logEvent, requestIdFromHeaders } from "@/lib/server/structured-log";
 
 export const dynamic = "force-dynamic";
@@ -99,6 +100,7 @@ export async function POST(request: Request) {
     itemId: result.override.item_id,
     reason: "admin_override",
   });
+  const cacheInvalidation = revalidatePublicPricingCaches();
 
   return NextResponse.json({
     ok: true,
@@ -109,5 +111,6 @@ export async function POST(request: Request) {
       pricingTier: item.pricingTier,
     },
     override: result.override,
+    cacheInvalidation,
   });
 }

@@ -43,6 +43,10 @@ async function firstScheduledCriticalPricingItem() {
   return [...criticalItems].sort((a, b) => a.category.localeCompare(b.category) || a.itemId - b.itemId)[0];
 }
 
+function validatedSource(category: string, source: string): string {
+  return `category_validated=${category}; ${source}`;
+}
+
 async function seedHealthyPricingFreshness(): Promise<void> {
   const adapter = db.getAdapter();
 
@@ -65,9 +69,9 @@ async function seedHealthyPricingFreshness(): Promise<void> {
       assemblyMarkupPct: 15,
       finalPriceEur: Number((marketAvg * 1.15).toFixed(2)),
       sampleCount: 2,
-      sources: `Monitor Test €${marketAvg.toFixed(2)} match=2/2`,
+      sources: validatedSource(item.category, `Monitor Test €${marketAvg.toFixed(2)} match=2/2`),
     });
-    await db.insertPriceHistory(item.category, item.itemId, marketAvg, `Monitor Test €${marketAvg.toFixed(2)} match=2/2`);
+    await db.insertPriceHistory(item.category, item.itemId, marketAvg, validatedSource(item.category, `Monitor Test €${marketAvg.toFixed(2)} match=2/2`));
   }
 
   const startedAt = new Date(Date.now() - 60_000).toISOString();
@@ -111,11 +115,15 @@ function setPreviewCheckoutEnv(): () => void {
   const oldPublicStripeKey = process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY;
   const oldStripePublishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
   const oldVercelEnv = process.env.VERCEL_ENV;
+  const oldMaxOrderEur = process.env.DIRECT_CHECKOUT_MAX_ORDER_EUR;
+  const oldLegacyMaxOrderEur = process.env.CHECKOUT_MAX_ORDER_EUR;
 
   process.env.NEXT_PUBLIC_APP_URL = "https://example.test";
   process.env.STRIPE_SECRET_KEY = "sk_test_checkout";
   process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY = "pk_test_checkout";
   delete process.env.STRIPE_PUBLISHABLE_KEY;
+  delete process.env.DIRECT_CHECKOUT_MAX_ORDER_EUR;
+  delete process.env.CHECKOUT_MAX_ORDER_EUR;
   process.env.VERCEL_ENV = "preview";
 
   return () => {
@@ -129,6 +137,10 @@ function setPreviewCheckoutEnv(): () => void {
     else process.env.STRIPE_PUBLISHABLE_KEY = oldStripePublishableKey;
     if (oldVercelEnv === undefined) delete process.env.VERCEL_ENV;
     else process.env.VERCEL_ENV = oldVercelEnv;
+    if (oldMaxOrderEur === undefined) delete process.env.DIRECT_CHECKOUT_MAX_ORDER_EUR;
+    else process.env.DIRECT_CHECKOUT_MAX_ORDER_EUR = oldMaxOrderEur;
+    if (oldLegacyMaxOrderEur === undefined) delete process.env.CHECKOUT_MAX_ORDER_EUR;
+    else process.env.CHECKOUT_MAX_ORDER_EUR = oldLegacyMaxOrderEur;
   };
 }
 
@@ -171,9 +183,19 @@ async function insertCheckoutCreatedOrder({
   await db.getAdapter().execute(
     `INSERT INTO orders (
       user_id, profile_build_id, order_item_type, order_item_id, build_name,
-      amount_eur_cents, currency, status, stripe_checkout_session_id, created_at, updated_at
-    ) VALUES (?, 0, ?, ?, 'Email Test GPU', 123400, 'eur', ?, ?, ?, ?)`,
-    [userId, itemType, itemId, status, checkoutSessionId, now, now],
+      amount_eur_cents, currency, status, stripe_checkout_session_id, paid_at, payment_confirmed_at, created_at, updated_at
+    ) VALUES (?, 0, ?, ?, 'Email Test GPU', 123400, 'eur', ?, ?, ?, ?, ?, ?)`,
+    [
+      userId,
+      itemType,
+      itemId,
+      status,
+      checkoutSessionId,
+      status === "PAID" ? now : null,
+      status === "PAID" ? now : null,
+      now,
+      now,
+    ],
   );
   const row = await db.getAdapter().queryOne<{ id: number }>(
     "SELECT id FROM orders WHERE stripe_checkout_session_id = ? LIMIT 1",
@@ -270,6 +292,50 @@ function checkoutSessionEvent({
       },
     },
   };
+}
+
+function stripeCheckoutSessionForOrder({
+  orderId,
+  userId,
+  checkoutSessionId,
+  amountTotal = 123400,
+  currency = "eur",
+  paymentStatus = "paid",
+  status = "complete",
+  mode = "payment",
+  paymentIntent = "pi_reconcile_test",
+  itemType = "GPU",
+  itemId = 1,
+}: {
+  orderId: number;
+  userId: number;
+  checkoutSessionId: string;
+  amountTotal?: number;
+  currency?: string;
+  paymentStatus?: string;
+  status?: string | null;
+  mode?: string;
+  paymentIntent?: string | null;
+  itemType?: string;
+  itemId?: number;
+}): Stripe.Checkout.Session {
+  return {
+    id: checkoutSessionId,
+    object: "checkout.session",
+    amount_total: amountTotal,
+    currency,
+    mode,
+    payment_status: paymentStatus,
+    status,
+    payment_intent: paymentIntent,
+    metadata: {
+      order_id: String(orderId),
+      user_id: String(userId),
+      order_item_type: itemType,
+      order_item_id: String(itemId),
+    },
+    lastResponse: { requestId: "req_reconcile_test" },
+  } as unknown as Stripe.Checkout.Session;
 }
 
 async function withMockedPaymentEmailEnv<T>(
@@ -405,7 +471,7 @@ test("Estonian market price checks reject bad data and ignore stale trusted-look
       assemblyMarkupPct: 15,
       finalPriceEur: 1150,
       sampleCount: 2,
-      sources: "Retailer €1000 match=2/2",
+      sources: validatedSource("gpu", "Retailer €1000 match=2/2"),
     }),
     /outside 0\.55x-2\.2x base price bounds/,
   );
@@ -420,9 +486,24 @@ test("Estonian market price checks reject bad data and ignore stale trusted-look
       assemblyMarkupPct: 15,
       finalPriceEur: 100,
       sampleCount: 2,
-      sources: "Retailer €100 match=2/2",
+      sources: validatedSource("gpu", "Retailer €100 match=2/2"),
     }),
     /finalPriceEur does not match/,
+  );
+
+  await assert.rejects(
+    () => db.upsertEstonianPriceCheck({
+      category: "gpu",
+      itemId: 515154,
+      itemName: "Unvalidated GPU",
+      basePriceEur: 100,
+      marketAvgEur: 100,
+      assemblyMarkupPct: 15,
+      finalPriceEur: 115,
+      sampleCount: 2,
+      sources: "Retailer €100 match=2/2",
+    }),
+    /category validation/,
   );
 
   await db.upsertEstonianPriceCheck({
@@ -434,7 +515,7 @@ test("Estonian market price checks reject bad data and ignore stale trusted-look
     assemblyMarkupPct: 15,
     finalPriceEur: 126.5,
     sampleCount: 2,
-    sources: "Retailer €110 match=2/2",
+    sources: validatedSource("gpu", "Retailer €110 match=2/2"),
   });
 
   const validCheck = await db.getEstonianPriceCheck("gpu", 515153);
@@ -459,7 +540,7 @@ test("backfillPriceHistoryFromChecks is idempotent for existing recorded dates",
     assemblyMarkupPct: 15,
     finalPriceEur: 253,
     sampleCount: 2,
-    sources: "Retailer €220 match=2/2",
+    sources: validatedSource("cpu", "Retailer €220 match=2/2"),
   });
 
   const targetDate = new Date().toISOString().slice(0, 10);
@@ -589,7 +670,7 @@ test("seeded profile and Mac eGPU builds have no compatibility issues", async ()
     return warnings.map((warning) => `${build.name}: ${warning.message}`);
   });
 
-  assert.equal(profileBuilds.length, 22);
+  assert.equal(profileBuilds.length, 21);
   assert.equal(macEgpuBuilds.length, 5);
   assert.deepEqual(profileIssues, []);
   assert.deepEqual(macEgpuIssues, []);
@@ -1079,6 +1160,35 @@ test("complete pricing refresh records a successful run and lastSuccessfulRun", 
   assert.equal(report.processedItemCount, trackableItems.length);
 });
 
+test("seeded catalog removes misleading or invalid build and Mac records", async () => {
+  const staleBuilds = await db.getAdapter().queryAll<{ build_name: string }>(
+    `SELECT build_name
+     FROM profile_builds
+     WHERE build_name IN (
+       'Dual RTX 6000 Ada Tower',
+       'RTX 3090 Used Value Build',
+       'Efficient 20B Workstation',
+       'Cheapest 12GB VRAM Build'
+     )`,
+  );
+  assert.deepEqual(staleBuilds, []);
+
+  const teamServer = await db.getAdapter().queryOne<{ build_name: string; profile_label: string; notes: string }>(
+    "SELECT build_name, profile_label, notes FROM profile_builds WHERE build_name = ? LIMIT 1",
+    ["RTX 6000 Ada Team Server"],
+  );
+  assert.ok(teamServer);
+  assert.equal(teamServer.profile_label, "High-Memory AI Server");
+  assert.match(teamServer.notes, /one RTX 6000 Ada/);
+  assert.match(teamServer.notes, /schema prices one GPU per build/);
+
+  const invalidMac = await db.getAdapter().queryOne<{ id: number }>(
+    "SELECT id FROM mac_systems WHERE name = ? LIMIT 1",
+    ["Mac mini M4 Pro 128GB / 2TB"],
+  );
+  assert.equal(invalidMac, null);
+});
+
 test("pricing health ignores stale background items but fails stale critical items", async () => {
   await seedHealthyPricingFreshness();
   const background = (await db.listBackgroundPriceTrackableItems())[0];
@@ -1217,6 +1327,72 @@ test("pricing cron prioritizes stale critical items and rotates background capac
   assert.notEqual(secondBackground, firstBackground);
 });
 
+test("pricing freshness and cron share the price-trackable catalog set", async () => {
+  await db.getAdapter().execute("DELETE FROM price_history");
+  await db.getAdapter().execute("DELETE FROM estonian_price_checks");
+  await db.getAdapter().execute("DELETE FROM pricing_run_failures");
+  await db.getAdapter().execute("DELETE FROM pricing_runs");
+
+  const trackableItems = await db.listPriceTrackableCatalogItems();
+  const categories = new Set(trackableItems.map((item) => item.category));
+  assert.ok(categories.has("gpu"));
+  assert.ok(categories.has("compact_ai_system"));
+  assert.equal(categories.has("mac_system"), false);
+  assert.equal(categories.has("external_gpu_enclosure"), false);
+
+  const { refreshEstonianMarketPricing } = await import("../src/lib/server/estonian-pricing-service");
+  const summary = await refreshEstonianMarketPricing({
+    maxItems: 1,
+    concurrency: 1,
+    fetchPrice: async () => null,
+  });
+  assert.equal(summary.trackableItems, trackableItems.length);
+  assert.equal(summary.healthCriticalItems, trackableItems.filter((item) => item.pricingTier === "critical").length);
+  assert.equal(summary.checked, 1);
+  assert.equal(summary.status, "PARTIAL");
+
+  const report = await db.getPricingFreshnessReport();
+  assert.equal(report.expectedItems, summary.healthCriticalItems);
+  assert.equal(report.trackableItemCount, trackableItems.length);
+  assert.equal(report.healthCriticalItemCount, summary.healthCriticalItems);
+  assert.equal(report.processedItemCount, 1);
+  assert.match(report.expectedVsProcessedMismatchWarning ?? "", /checked 1 of \d+ trackable/);
+  assert.equal(report.skippedItemCountByReason.no_trusted_retailer_quote, 1);
+  assert.equal(report.sampleSkippedItems[0]?.query, report.sampleSkippedItems[0]?.name);
+  assert.equal(report.healthy, false);
+});
+
+test("complete pricing refresh records a successful run and lastSuccessfulRun", async () => {
+  await db.getAdapter().execute("DELETE FROM price_history");
+  await db.getAdapter().execute("DELETE FROM estonian_price_checks");
+  await db.getAdapter().execute("DELETE FROM pricing_run_failures");
+  await db.getAdapter().execute("DELETE FROM pricing_runs");
+
+  const trackableItems = await db.listPriceTrackableCatalogItems();
+  const { refreshEstonianMarketPricing } = await import("../src/lib/server/estonian-pricing-service");
+  const summary = await refreshEstonianMarketPricing({
+    maxItems: trackableItems.length,
+    concurrency: 8,
+    fetchPrice: async (_query, basePrice) => ({
+      price: basePrice,
+      sampleCount: 2,
+      sources: `Fixture €${basePrice.toFixed(2)} match=2/2`,
+    }),
+  });
+
+  assert.equal(summary.status, "SUCCESS");
+  assert.equal(summary.trackableItems, trackableItems.length);
+  assert.equal(summary.processedItems, trackableItems.length);
+  assert.equal(summary.expectedVsProcessedMismatchWarning, null);
+
+  const report = await db.getPricingFreshnessReport();
+  assert.equal(report.healthy, true);
+  assert.ok(report.lastSuccessfulRun);
+  assert.equal(report.expectedItems, summary.healthCriticalItems);
+  assert.equal(report.processedItemCount, trackableItems.length);
+  assert.equal(report.healthCriticalItemCount, summary.healthCriticalItems);
+});
+
 test("retailer GPU normalization preserves Ti and SUPER model tokens", async () => {
   const { pricingProductTokens, retailerSearchQuery } = await import("../src/lib/server/estonian-pricing-service");
 
@@ -1261,6 +1437,115 @@ test("retailer GPU matching requires Ti modifier when catalog item includes Ti",
 
   assert.equal(scoreRetailerProductContext(tokens, context), 4);
   assert.equal(hasAcceptableRetailerProductMatch(tokens, context), false);
+});
+
+test("retailer diagnostics apply category-specific component validation", async () => {
+  const { diagnoseEstonianRetailerMatch } = await import("../src/lib/server/estonian-pricing-service");
+  const cases: Array<{
+    category: "gpu" | "cpu" | "motherboard" | "storage_drive" | "power_supply" | "cpu_cooler" | "case";
+    catalog: string;
+    basePrice: number;
+    acceptedName: string;
+    rejectedName: string;
+    expectedReason: RegExp;
+  }> = [
+    {
+      category: "gpu",
+      catalog: "NVIDIA RTX 4060 Ti 16GB",
+      basePrice: 479,
+      acceptedName: "NVIDIA GeForce RTX 4060 Ti 16GB GDDR6 desktop graphics card",
+      rejectedName: "NVIDIA GeForce RTX 4060 Ti 8GB Laptop GPU mobile graphics card",
+      expectedReason: /gpu_vram_mismatch|gpu_mobile_mismatch/,
+    },
+    {
+      category: "cpu",
+      catalog: "AMD Ryzen 7 7800X3D",
+      basePrice: 399,
+      acceptedName: "AMD Ryzen 7 7800X3D BOX AM5 processor",
+      rejectedName: "Gaming PC bundle with AMD Ryzen 7 7800X3D RTX graphics",
+      expectedReason: /unsafe_bundle_listing_context/,
+    },
+    {
+      category: "motherboard",
+      catalog: "MSI MAG X670E Tomahawk WiFi",
+      basePrice: 319,
+      acceptedName: "MSI MAG X670E Tomahawk WiFi AM5 DDR5 ATX motherboard",
+      rejectedName: "MSI MAG B650 Tomahawk WiFi AM5 DDR5 ATX motherboard",
+      expectedReason: /motherboard_chipset_mismatch/,
+    },
+    {
+      category: "storage_drive",
+      catalog: "Samsung 990 Pro 2TB",
+      basePrice: 179,
+      acceptedName: "Samsung 990 Pro 2TB M.2 2280 NVMe SSD",
+      rejectedName: "Samsung 990 Pro 1TB M.2 2280 NVMe SSD",
+      expectedReason: /storage_capacity_mismatch/,
+    },
+    {
+      category: "power_supply",
+      catalog: "Corsair RM850e 850W",
+      basePrice: 139,
+      acceptedName: "Corsair RM850e 850W 80+ Gold ATX 3.0 PSU",
+      rejectedName: "Corsair RM750e 750W 80+ Gold ATX 3.0 PSU",
+      expectedReason: /psu_wattage_mismatch/,
+    },
+    {
+      category: "cpu_cooler",
+      catalog: "Arctic Liquid Freezer III 360",
+      basePrice: 119,
+      acceptedName: "Arctic Liquid Freezer III 360mm AIO CPU cooler",
+      rejectedName: "Arctic Liquid Freezer III 240mm AIO CPU cooler",
+      expectedReason: /cooler_size_mismatch/,
+    },
+    {
+      category: "case",
+      catalog: "Fractal Design North",
+      basePrice: 149,
+      acceptedName: "Fractal Design North ATX PC case",
+      rejectedName: "Fractal Design North XL E-ATX PC case",
+      expectedReason: /case_size_variant_mismatch/,
+    },
+  ];
+
+  for (const testCase of cases) {
+    const accepted = await diagnoseEstonianRetailerMatch(testCase.catalog, testCase.basePrice, {
+      category: testCase.category,
+      sources: [{ name: `Accepted ${testCase.category}`, url: "https://example.test/accepted" }],
+      fetchHtml: async () => ({
+        ok: true,
+        status: 200,
+        html: `<article><a>${testCase.acceptedName}</a><span>${testCase.basePrice},00 €</span></article>`,
+      }),
+    });
+    assert.equal(accepted.sources[0].bestAcceptedCandidate?.rejectionReason, "accepted", testCase.category);
+    assert.equal(accepted.aggregate.sampleCount, 1, testCase.category);
+
+    const rejected = await diagnoseEstonianRetailerMatch(testCase.catalog, testCase.basePrice, {
+      category: testCase.category,
+      sources: [{ name: `Rejected ${testCase.category}`, url: "https://example.test/rejected" }],
+      fetchHtml: async () => ({
+        ok: true,
+        status: 200,
+        html: `<article><a>${testCase.rejectedName}</a><span>${testCase.basePrice},00 €</span></article>`,
+      }),
+    });
+    const candidate = rejected.sources[0].parsedCandidates[0];
+    assert.equal(candidate?.accepted, false, testCase.category);
+    assert.equal(candidate?.rejectionReason, "category_spec_mismatch", testCase.category);
+    assert.match(candidate?.rejectionReasons.join(" ") ?? "", testCase.expectedReason, testCase.category);
+    assert.equal(rejected.aggregate.sampleCount, 0, testCase.category);
+  }
+});
+
+test("admin pricing match diagnostics resolve category-specific validation scope", async () => {
+  const { pricingDiagnosticCategory } = await import("../src/app/api/admin/pricing-match-diagnostics/route");
+
+  assert.equal(pricingDiagnosticCategory("gpu"), "gpu");
+  assert.equal(pricingDiagnosticCategory("ram_kit"), "ram_kit");
+  assert.equal(pricingDiagnosticCategory("motherboard"), "motherboard");
+  assert.equal(pricingDiagnosticCategory("storage_drive"), "storage_drive");
+  assert.equal(pricingDiagnosticCategory("mac_system"), undefined);
+  assert.equal(pricingDiagnosticCategory(undefined), undefined);
 });
 
 test("retailer RAM near-miss exposes MHz and missing kit-token rejection", async () => {
@@ -1360,6 +1645,107 @@ test("retailer diagnostics can search simplified RAM query while matching full c
   assert.equal(diagnostic.finalRejectionReason, "no_trusted_retailer_quote");
 });
 
+test("RAM retailer diagnostics accept exact Kingston Fury Beast 32GB 2x16 DDR5-6000 CL36 desktop kit", async () => {
+  const { diagnoseEstonianRetailerMatch } = await import("../src/lib/server/estonian-pricing-service");
+  const diagnostic = await diagnoseEstonianRetailerMatch("Kingston Fury Beast 32GB (2x16GB) DDR5-6000 CL36", 439, {
+    includeSnippets: true,
+    sources: [{ name: "Fixture Hinnavaatlus", url: "https://example.test/ram" }],
+    fetchHtml: async () => ({
+      ok: true,
+      status: 200,
+      html: `
+        <article>
+          <a>Kingston Fury Beast 32GB (2x16GB) DDR5-6000 CL36 DIMM desktop kit</a>
+          <span>439,00 €</span>
+        </article>
+      `,
+    }),
+  });
+
+  assert.equal(diagnostic.sources[0].bestAcceptedCandidate?.price, 439);
+  assert.equal(diagnostic.sources[0].bestAcceptedCandidate?.rejectionReason, "accepted");
+  assert.deepEqual(diagnostic.sources[0].bestAcceptedCandidate?.rejectionReasons, []);
+  assert.equal(diagnostic.aggregate.sampleCount, 1);
+});
+
+test("RAM retailer diagnostics reject common Kingston Fury Beast false positives", async () => {
+  const { diagnoseEstonianRetailerMatch } = await import("../src/lib/server/estonian-pricing-service");
+  const catalogName = "Kingston Fury Beast 32GB (2x16GB) DDR5-6000 CL36";
+  const cases: Array<{ name: string; htmlName: string; expectedReason: RegExp }> = [
+    {
+      name: "16GB single stick",
+      htmlName: "Kingston Fury Beast 16GB DDR5-6000 CL36 DIMM desktop memory",
+      expectedReason: /ram_capacity_mismatch/,
+    },
+    {
+      name: "1x32GB kit",
+      htmlName: "Kingston Fury Beast 32GB (1x32GB) DDR5-6000 CL36 DIMM desktop memory",
+      expectedReason: /ram_module_count_mismatch/,
+    },
+    {
+      name: "DDR4 kit",
+      htmlName: "Kingston Fury Beast 32GB (2x16GB) DDR4-6000 CL36 DIMM desktop memory",
+      expectedReason: /ram_ddr_generation_mismatch/,
+    },
+    {
+      name: "SO-DIMM laptop kit",
+      htmlName: "Kingston Fury Beast 32GB (2x16GB) DDR5-6000 CL36 SO-DIMM laptop memory",
+      expectedReason: /ram_sodimm_mismatch/,
+    },
+    {
+      name: "wrong speed",
+      htmlName: "Kingston Fury Beast 32GB (2x16GB) DDR5-5600 CL36 DIMM desktop memory",
+      expectedReason: /ram_speed_mismatch/,
+    },
+    {
+      name: "wrong CAS and RGB variant",
+      htmlName: "Kingston Fury Beast RGB 32GB (2x16GB) DDR5-6000 CL40 DIMM desktop memory",
+      expectedReason: /ram_cas_mismatch|ram_rgb_mismatch/,
+    },
+  ];
+
+  for (const testCase of cases) {
+    const diagnostic = await diagnoseEstonianRetailerMatch(catalogName, 439, {
+      sources: [{ name: `Fixture ${testCase.name}`, url: "https://example.test/ram" }],
+      fetchHtml: async () => ({
+        ok: true,
+        status: 200,
+        html: `<article><a>${testCase.htmlName}</a><span>439,00 €</span></article>`,
+      }),
+    });
+
+    const candidate = diagnostic.sources[0].parsedCandidates[0];
+    assert.equal(candidate?.accepted, false, testCase.name);
+    assert.equal(candidate?.rejectionReason, "ram_spec_mismatch", testCase.name);
+    assert.match(candidate?.rejectionReasons.join(" ") ?? "", testCase.expectedReason, testCase.name);
+    assert.equal(diagnostic.aggregate.sampleCount, 0, testCase.name);
+  }
+});
+
+test("RAM retailer diagnostics reject Kingston Fury Beast price outliers before trust", async () => {
+  const { diagnoseEstonianRetailerMatch } = await import("../src/lib/server/estonian-pricing-service");
+  const diagnostic = await diagnoseEstonianRetailerMatch("Kingston Fury Beast 32GB (2x16GB) DDR5-6000 CL36", 439, {
+    includeSnippets: true,
+    sources: [{ name: "Fixture Hinnavaatlus", url: "https://example.test/ram" }],
+    fetchHtml: async () => ({
+      ok: true,
+      status: 200,
+      html: `
+        <article>
+          <a>Kingston Fury Beast 32GB (2x16GB) DDR5-6000 CL36 DIMM desktop kit</a>
+          <span>137,00 €</span>
+        </article>
+      `,
+    }),
+  });
+
+  assert.equal(diagnostic.sources[0].priceMatchCount, 1);
+  assert.equal(diagnostic.sources[0].inRatioCount, 0);
+  assert.equal(diagnostic.sources[0].rejectionReason, "all_prices_outside_ratio");
+  assert.equal(diagnostic.aggregate.sampleCount, 0);
+  assert.equal(diagnostic.finalRejectionReason, "no_trusted_retailer_quote");
+});
+
 test("database-backed rate limiter blocks after the configured window allowance", async () => {
   const { checkRateLimit } = await import("../src/lib/request-utils");
   const key = `test-rate:${Date.now()}`;
@@ -1414,6 +1800,15 @@ test("Stripe webhook events can retry after failed processing but not after succ
   assert.equal(await db.reserveStripeWebhookEvent(eventId, "checkout.session.completed"), "duplicate");
 });
 
+test("Stripe client is configured with bounded network behavior and request id helpers", async () => {
+  const source = readFileSync(join(process.cwd(), "src/lib/stripe.ts"), "utf8");
+
+  assert.match(source, /timeout:\s*10_000/);
+  assert.match(source, /maxNetworkRetries:\s*2/);
+  assert.match(source, /stripeRequestIdFromError/);
+  assert.match(source, /stripeRequestIdFromObject/);
+});
+
 test("duplicate paid checkout webhooks do not duplicate fulfillment or emails", async () => {
   const nodemailerModule = await import("nodemailer");
   const nodemailer = nodemailerModule.default;
@@ -1461,6 +1856,8 @@ test("duplicate paid checkout webhooks do not duplicate fulfillment or emails", 
     assert.equal(second.status, 200);
     assert.equal((await second.json() as { duplicate?: boolean }).duplicate, true);
     assert.equal(order?.status, "PAID");
+    assert.ok(order?.payment_confirmed_at);
+    assert.equal(order?.fulfilled_at, null);
     assert.ok(order?.customer_email_sent_at);
     assert.ok(order?.admin_email_sent_at);
     assert.equal(sent.length, 2);
@@ -1566,7 +1963,8 @@ test("paid checkout webhooks recover signed orphan sessions after DB link failur
       assert.equal(order?.id, orderId);
       assert.equal(order?.status, "PAID");
       assert.equal(order?.stripe_checkout_session_id, checkoutSessionId);
-      assert.ok(order?.fulfilled_at);
+      assert.ok(order?.payment_confirmed_at);
+      assert.equal(order?.fulfilled_at, null);
       assert.equal(sent.length, 2);
       assert.match(lines.join("\n"), /webhook_orphan_session_recovered/);
     });
@@ -1924,6 +2322,21 @@ test("client components render empty and sparse data states without throwing", a
   assert.match(singlePointGraph, /1 data point/);
   assert.match(singlePointGraph, /Latest Estonian market average before assembly/);
 
+  const currentOnlyCatalogGraph = renderToStaticMarkup(React.createElement(PriceGraph, {
+    ranges: {
+      "7d": [],
+      "30d": [],
+      "90d": [],
+    },
+    preorderPriceEur: 115,
+    marketAvgEur: 100,
+    checkedAt: "2026-05-04T12:00:00.000Z",
+  }));
+  assert.doesNotMatch(currentOnlyCatalogGraph, /No historical pricing yet/);
+  assert.match(currentOnlyCatalogGraph, /Current component pricing is available, but more historical data is needed to show a trend/);
+  assert.match(currentOnlyCatalogGraph, /1 data point/);
+  assert.match(currentOnlyCatalogGraph, /Latest Estonian market average before assembly/);
+
   const buildHistoryGraph = renderToStaticMarkup(React.createElement(BuildPriceHistoryChart, {
     series: [
       {
@@ -1952,10 +2365,66 @@ test("client components render empty and sparse data states without throwing", a
       },
     ],
   }));
-  assert.match(buildHistoryGraph, /All components and build total/);
-  assert.match(buildHistoryGraph, /Latest build total/);
+  assert.match(buildHistoryGraph, /All components and market total/);
+  assert.match(buildHistoryGraph, /Latest market total/);
+  assert.match(buildHistoryGraph, /€1,290/);
+  assert.doesNotMatch(buildHistoryGraph, /€1,484/);
   assert.match(buildHistoryGraph, /GPU/);
   assert.match(buildHistoryGraph, /CPU/);
+
+  const currentOnlyBuildHistoryGraph = renderToStaticMarkup(React.createElement(BuildPriceHistoryChart, {
+    series: [
+      {
+        key: "gpu:2",
+        label: "GPU",
+        name: "RTX current",
+        orderPriceEur: 1150,
+        marketAvgEur: 1000,
+        checkedAt: "2026-05-04T12:00:00.000Z",
+        ranges: {
+          "7d": [],
+          "30d": [],
+          "90d": [],
+        },
+      },
+      {
+        key: "cpu:2",
+        label: "CPU",
+        name: "Ryzen current",
+        orderPriceEur: 345,
+        marketAvgEur: 300,
+        checkedAt: "2026-05-04T12:00:00.000Z",
+        ranges: {
+          "7d": [],
+          "30d": [],
+          "90d": [],
+        },
+      },
+    ],
+  }));
+  assert.doesNotMatch(currentOnlyBuildHistoryGraph, /Component price history is not available yet/);
+  assert.match(currentOnlyBuildHistoryGraph, /Current component pricing is available, but more historical data is needed to show a trend/);
+  assert.match(currentOnlyBuildHistoryGraph, /Latest market total/);
+
+  const genuinelyEmptyBuildHistoryGraph = renderToStaticMarkup(React.createElement(BuildPriceHistoryChart, {
+    series: [
+      {
+        key: "gpu:3",
+        label: "GPU",
+        name: "RTX unavailable",
+        orderPriceEur: 1150,
+        marketAvgEur: null,
+        checkedAt: null,
+        ranges: {
+          "7d": [],
+          "30d": [],
+          "90d": [],
+        },
+      },
+    ],
+  }));
+  assert.match(genuinelyEmptyBuildHistoryGraph, /Component price history is not available yet/);
+  assert.match(genuinelyEmptyBuildHistoryGraph, /first successful pricing refresh stores usable component pricing/);
 
   const unavailableCheckout = renderToStaticMarkup(React.createElement(PurchaseBuildButton, {
     itemType: "gpu",
@@ -2034,6 +2503,108 @@ test("fallback-only pricing blocks direct checkout eligibility", async () => {
   }
 });
 
+test("direct checkout rejects unvalidated legacy rows and low retailer confidence", async () => {
+  await seedHealthyPricingFreshness();
+  const restoreEnv = setPreviewCheckoutEnv();
+
+  try {
+    await db.getAdapter().execute(
+      "UPDATE estonian_price_checks SET sources = ?, checked_at = ? WHERE category = ? AND item_id = ?",
+      ["Legacy Retailer €100 match=2/2", new Date().toISOString(), "gpu", 1],
+    );
+
+    const { getCatalogItemCheckoutEligibility } = await import("../src/lib/server/checkout-availability");
+    const legacy = await getCatalogItemCheckoutEligibility("gpu", 1);
+    assert.equal(legacy.eligible, false);
+    assert.equal(legacy.reason, "fallback_pricing");
+
+    await db.getAdapter().execute(
+      "UPDATE estonian_price_checks SET sources = ?, checked_at = ? WHERE category = ? AND item_id = ?",
+      [validatedSource("cpu", "Wrong marker Retailer €100 match=2/2"), new Date().toISOString(), "gpu", 1],
+    );
+    const wrongMarkerRows = await db.listEstonianPriceChecks();
+    assert.equal(wrongMarkerRows.some((row) => row.category === "gpu" && row.item_id === 1), false);
+    const wrongMarker = await getCatalogItemCheckoutEligibility("gpu", 1);
+    assert.equal(wrongMarker.eligible, false);
+    assert.equal(wrongMarker.reason, "fallback_pricing");
+
+    const gpu = await db.getGpuById(1);
+    assert.ok(gpu);
+    await db.getAdapter().execute(
+      "UPDATE estonian_price_checks SET sources = ?, sample_count = ?, checked_at = ? WHERE category = ? AND item_id = ?",
+      [validatedSource("gpu", `Retailer €${gpu.price_eur} match=1/1`), 1, new Date().toISOString(), "gpu", 1],
+    );
+    const lowSample = await getCatalogItemCheckoutEligibility("gpu", 1);
+    assert.equal(lowSample.eligible, false);
+    assert.equal(lowSample.reason, "pricing_unhealthy");
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("current catalog reference sanity blocks legacy rows with stale base prices", async () => {
+  await seedHealthyPricingFreshness();
+  const restoreEnv = setPreviewCheckoutEnv();
+
+  try {
+    await db.getAdapter().execute(
+      `UPDATE estonian_price_checks
+       SET base_price_eur = 100,
+           market_avg_eur = 100,
+           final_price_eur = 115,
+           sample_count = 2,
+           sources = ?,
+           checked_at = ?
+       WHERE category = ? AND item_id = ?`,
+      [validatedSource("gpu", "Legacy Retailer €100 match=2/2"), new Date().toISOString(), "gpu", 1],
+    );
+
+    const trustedRows = await db.listEstonianPriceChecks();
+    assert.equal(trustedRows.some((row) => row.category === "gpu" && row.item_id === 1), false);
+
+    const { getCatalogItemCheckoutEligibility } = await import("../src/lib/server/checkout-availability");
+    const eligibility = await getCatalogItemCheckoutEligibility("gpu", 1);
+
+    assert.equal(eligibility.eligible, false);
+    assert.equal(eligibility.reason, "fallback_pricing");
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("expired admin override-backed price checks are not trusted for checkout", async () => {
+  await seedHealthyPricingFreshness();
+  const restoreEnv = setPreviewCheckoutEnv();
+  const gpu = await db.getGpuById(1);
+  assert.ok(gpu);
+
+  try {
+    const expiredSource = "admin_override; not_retailer_derived; source_note=Expired manual quote; expires_at=2000-01-01T00:00:00.000Z; created_by=test_admin; match=admin-reviewed";
+    await db.getAdapter().execute(
+      `UPDATE estonian_price_checks
+       SET sources = ?,
+           sample_count = 1,
+           checked_at = ?,
+           market_avg_eur = ?,
+           final_price_eur = ?
+       WHERE category = ? AND item_id = ?`,
+      [expiredSource, new Date().toISOString(), gpu.price_eur, Number((gpu.price_eur * 1.15).toFixed(2)), "gpu", gpu.id],
+    );
+
+    assert.equal(await db.getEstonianPriceCheck("gpu", gpu.id), null);
+    const trustedRows = await db.listEstonianPriceChecks();
+    assert.equal(trustedRows.some((row) => row.category === "gpu" && row.item_id === gpu.id), false);
+
+    const { getCatalogItemCheckoutEligibility } = await import("../src/lib/server/checkout-availability");
+    const eligibility = await getCatalogItemCheckoutEligibility("gpu", gpu.id);
+
+    assert.equal(eligibility.eligible, false);
+    assert.equal(eligibility.reason, "fallback_pricing");
+  } finally {
+    restoreEnv();
+  }
+});
+
 test("quote-only Mac eGPU builds are not direct checkout eligible", async () => {
   const restoreEnv = setPreviewCheckoutEnv();
 
@@ -2068,6 +2639,174 @@ test("out-of-stock build components block direct checkout eligibility", async ()
   }
 });
 
+test("fresh trusted build component prices under limit allow direct checkout", async () => {
+  await seedHealthyPricingFreshness();
+  const restoreEnv = setPreviewCheckoutEnv();
+
+  try {
+    process.env.DIRECT_CHECKOUT_MAX_ORDER_EUR = "999999";
+    const { getBuildCheckoutEligibility } = await import("../src/lib/server/checkout-availability");
+    const eligibility = await getBuildCheckoutEligibility(1);
+
+    assert.equal(eligibility.eligible, true);
+    assert.equal(eligibility.reason, undefined);
+    assert.ok((eligibility.orderPriceEur ?? 0) > 0);
+    assert.equal(eligibility.maxOrderEur, 999999);
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("missing RAM trusted price makes build quote-only for RAM pricing, not order limit", async () => {
+  await seedHealthyPricingFreshness();
+  const restoreEnv = setPreviewCheckoutEnv();
+  const build = await db.getProfileBuildById(1);
+  assert.ok(build);
+  const ramKitId = build.ram_kit_id;
+  if (typeof ramKitId !== "number") {
+    throw new Error("Expected test profile build to include RAM");
+  }
+
+  try {
+    process.env.DIRECT_CHECKOUT_MAX_ORDER_EUR = "999999";
+    await db.getAdapter().execute("DELETE FROM estonian_price_checks WHERE category = ? AND item_id = ?", ["ram_kit", ramKitId]);
+
+    const { getBuildCheckoutEligibility } = await import("../src/lib/server/checkout-availability");
+    const eligibility = await getBuildCheckoutEligibility(build.id);
+
+    assert.equal(eligibility.eligible, false);
+    assert.equal(eligibility.reason, "missing_trusted_component_pricing");
+    assert.equal(eligibility.blockers?.[0]?.label, "RAM");
+    assert.equal(eligibility.blockers?.[0]?.reason, "fallback_pricing");
+    assert.doesNotMatch(eligibility.message, /limit/i);
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("fallback RAM estimate does not feed trusted build limit comparison", async () => {
+  await seedHealthyPricingFreshness();
+  const restoreEnv = setPreviewCheckoutEnv();
+  const build = await db.getProfileBuildById(1);
+  assert.ok(build);
+
+  try {
+    process.env.DIRECT_CHECKOUT_MAX_ORDER_EUR = "1";
+    await db.getAdapter().execute("DELETE FROM estonian_price_checks WHERE category = ? AND item_id = ?", ["ram_kit", build.ram_kit_id]);
+
+    const { getBuildCheckoutEligibility } = await import("../src/lib/server/checkout-availability");
+    const eligibility = await getBuildCheckoutEligibility(build.id);
+
+    assert.equal(eligibility.eligible, false);
+    assert.equal(eligibility.reason, "missing_trusted_component_pricing");
+    assert.equal(eligibility.blockers?.[0]?.label, "RAM");
+    assert.equal(eligibility.orderPriceEur, undefined);
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("legacy bad RAM price check with old reference base is not trusted for checkout", async () => {
+  await seedHealthyPricingFreshness();
+  const restoreEnv = setPreviewCheckoutEnv();
+  const build = await db.getProfileBuildById(1);
+  assert.ok(build);
+  const ramKitId = build.ram_kit_id;
+  if (typeof ramKitId !== "number") {
+    throw new Error("Expected test profile build to include RAM");
+  }
+
+  try {
+    await db.getAdapter().execute(
+      `UPDATE estonian_price_checks
+       SET base_price_eur = 119,
+           market_avg_eur = 119,
+           final_price_eur = 136.85,
+           sample_count = 2,
+           checked_at = ?
+       WHERE category = ? AND item_id = ?`,
+      [new Date().toISOString(), "ram_kit", ramKitId],
+    );
+
+    const { getBuildCheckoutEligibility, getCatalogItemCheckoutEligibility } = await import("../src/lib/server/checkout-availability");
+    const buildEligibility = await getBuildCheckoutEligibility(build.id);
+    const ramEligibility = await getCatalogItemCheckoutEligibility("ram_kit", ramKitId);
+
+    assert.equal(buildEligibility.eligible, false);
+    assert.equal(buildEligibility.reason, "missing_trusted_component_pricing");
+    assert.equal(buildEligibility.blockers?.[0]?.label, "RAM");
+    assert.equal(buildEligibility.blockers?.[0]?.reason, "fallback_pricing");
+    assert.equal(ramEligibility.eligible, false);
+    assert.equal(ramEligibility.reason, "fallback_pricing");
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("trusted build total over configured limit is quote-only due to limit with euro cents intact", async () => {
+  await seedHealthyPricingFreshness();
+  const restoreEnv = setPreviewCheckoutEnv();
+
+  try {
+    const { getBuildCheckoutEligibility } = await import("../src/lib/server/checkout-availability");
+    const allowed = await getBuildCheckoutEligibility(1);
+    assert.equal(allowed.eligible, true);
+    const orderPriceEur = allowed.orderPriceEur ?? 0;
+    assert.ok(orderPriceEur > 1);
+
+    process.env.DIRECT_CHECKOUT_MAX_ORDER_EUR = String(orderPriceEur - 1);
+    const blocked = await getBuildCheckoutEligibility(1);
+
+    assert.equal(blocked.eligible, false);
+    assert.equal(blocked.reason, "order_limit_exceeded");
+    assert.equal(blocked.orderPriceEur, orderPriceEur);
+    assert.equal(blocked.amountEurCents, orderPriceEur * 100);
+    assert.equal(blocked.maxOrderEur, orderPriceEur - 1);
+    assert.match(blocked.message, /online checkout limit/i);
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("build checkout total uses component final prices with assembly markup once", async () => {
+  await seedHealthyPricingFreshness();
+  const restoreEnv = setPreviewCheckoutEnv();
+  const build = await db.getProfileBuildById(1);
+  assert.ok(build);
+
+  try {
+    const componentIds = [
+      ["gpu", build.gpu_id],
+      ["cpu", build.cpu_id],
+      ["ram_kit", build.ram_kit_id],
+      ["storage_drive", build.storage_drive_id],
+      ["motherboard", build.motherboard_id],
+      ["power_supply", build.power_supply_id],
+      ["case", build.case_id],
+      ["cpu_cooler", build.cpu_cooler_id],
+    ] as const;
+    let expectedTotal = 0;
+    for (const [category, itemId] of componentIds) {
+      const row = await db.getAdapter().queryOne<{ base_price_eur: number; final_price_eur: number }>(
+        "SELECT base_price_eur, final_price_eur FROM estonian_price_checks WHERE category = ? AND item_id = ?",
+        [category, itemId],
+      );
+      assert.ok(row, `${category}:${itemId} should have a trusted price check`);
+      assert.equal(row.final_price_eur, Number((row.base_price_eur * 1.15).toFixed(2)));
+      expectedTotal += Math.round(row.final_price_eur);
+    }
+
+    const { getBuildCheckoutEligibility } = await import("../src/lib/server/checkout-availability");
+    const eligibility = await getBuildCheckoutEligibility(build.id);
+
+    assert.equal(eligibility.eligible, true);
+    assert.equal(eligibility.orderPriceEur, expectedTotal);
+    assert.equal(eligibility.amountEurCents, expectedTotal * 100);
+  } finally {
+    restoreEnv();
+  }
+});
+
 test("checkout route blocks fallback pricing before creating an order or Stripe session", async () => {
   await seedHealthyPricingFreshness();
   await db.getAdapter().execute("DELETE FROM estonian_price_checks WHERE category = ? AND item_id = ?", ["gpu", 1]);
@@ -2097,7 +2836,22 @@ test("checkout route blocks fallback pricing before creating an order or Stripe 
   }
 });
 
+test("direct catalog order creation fails closed without trusted market pricing", async () => {
+  await seedHealthyPricingFreshness();
+  await db.getAdapter().execute("DELETE FROM estonian_price_checks WHERE category = ? AND item_id = ?", ["gpu", 1]);
+  const userId = await createTestUser("catalog-fail-closed");
+  const beforeCount = await orderCountForItem("GPU", 1);
+
+  const result = await db.createPendingOrderForCatalogItem({ userId, itemType: "GPU", itemId: 1 });
+
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("order should not be created from fallback pricing");
+  assert.match(result.message, /trusted market price/i);
+  assert.equal(await orderCountForItem("GPU", 1), beforeCount);
+});
+
 test("duplicate checkout attempts for the same user and item reuse one open order", async () => {
+  await seedHealthyPricingFreshness();
   const userId = await createTestUser("checkout-dedupe");
 
   const first = await db.createPendingOrderForCatalogItem({ userId, itemType: "GPU", itemId: 1 });
@@ -2116,6 +2870,7 @@ test("duplicate checkout attempts for the same user and item reuse one open orde
 });
 
 test("different users can checkout the same item independently", async () => {
+  await seedHealthyPricingFreshness();
   const firstUserId = await createTestUser("checkout-user-a");
   const secondUserId = await createTestUser("checkout-user-b");
 
@@ -2129,12 +2884,14 @@ test("different users can checkout the same item independently", async () => {
 });
 
 test("same user can checkout again after previous open order is no longer open", async () => {
+  await seedHealthyPricingFreshness();
   const userId = await createTestUser("checkout-after-terminal");
 
   const first = await db.createPendingOrderForCatalogItem({ userId, itemType: "RAM_KIT", itemId: 1 });
   assert.equal(first.ok, true);
   if (!first.ok) throw new Error("first order should be created");
-  await db.getAdapter().execute("UPDATE orders SET status = 'PAID' WHERE id = ?", [first.orderId]);
+  const paidAt = new Date().toISOString();
+  await db.getAdapter().execute("UPDATE orders SET status = 'PAID', paid_at = ?, payment_confirmed_at = ? WHERE id = ?", [paidAt, paidAt, first.orderId]);
 
   const second = await db.createPendingOrderForCatalogItem({ userId, itemType: "RAM_KIT", itemId: 1 });
   assert.equal(second.ok, true);
@@ -2352,11 +3109,11 @@ test("price transparency badges distinguish live, fallback, and low-sample price
 
   assert.deepEqual(
     getPriceTransparencyBadges({ priceSource: "market_live", checkedAt: "2026-05-04T08:00:00.000Z", sampleCount: 2 }, "en", now),
-    ["Updated today", "Estonian market estimate", "Includes 15% assembly markup"],
+    ["Updated today", "Trusted market price", "Includes 15% assembly markup"],
   );
   assert.deepEqual(
     getPriceTransparencyBadges({ priceSource: "market_live", checkedAt: "2026-05-02T08:00:00.000Z", sampleCount: 1 }, "en", now),
-    ["Updated 2 days ago", "Low sample", "Estonian market estimate", "Includes 15% assembly markup"],
+    ["Updated 2 days ago", "Low sample", "Trusted market price", "Includes 15% assembly markup"],
   );
   assert.deepEqual(
     getPriceTransparencyBadges({ priceSource: "seed_fallback", checkedAt: null, sampleCount: null }, "en", now),
@@ -2401,7 +3158,7 @@ test("catalog pricing metadata distinguishes fresh, stale, and absent market dat
     assemblyMarkupPct: 15,
     finalPriceEur: Number((cpu.price_eur * 1.15).toFixed(2)),
     sampleCount: 2,
-    sources: `Retailer €${cpu.price_eur} match=2/2`,
+    sources: validatedSource("cpu", `Retailer €${cpu.price_eur} match=2/2`),
   });
   const fresh = await getCatalogItemDetailView("cpu", cpu.id);
   assert.equal(fresh?.priceSource, "market_live");
@@ -2419,7 +3176,7 @@ test("catalog pricing metadata distinguishes fresh, stale, and absent market dat
     assemblyMarkupPct: 15,
     finalPriceEur: Number((gpu.price_eur * 1.15).toFixed(2)),
     sampleCount: 2,
-    sources: `Retailer €${gpu.price_eur} match=2/2`,
+    sources: validatedSource("gpu", `Retailer €${gpu.price_eur} match=2/2`),
   });
   await db.getAdapter().execute(
     "UPDATE estonian_price_checks SET checked_at = ? WHERE category = ? AND item_id = ?",
@@ -2475,6 +3232,7 @@ test("checkout success status component renders paid and pending states and targ
     lang: "en",
   }));
   assert.match(paidMarkup, /Payment confirmed/);
+  assert.match(paidMarkup, /Contact support/);
   assert.match(paidMarkup, /\/api\/payments\/session-status\?session_id=cs_paid/);
   assert.match(paidMarkup, /data-payment-status="PAID"/);
 
@@ -2646,6 +3404,15 @@ test("public health endpoint stays liveness-only when pricing is stale", async (
   }
 });
 
+test("public health endpoint bypasses persistent rate limiting so storage failure is not reported as 429", async () => {
+  const source = readFileSync(join(process.cwd(), "src/app/api/health/route.ts"), "utf8");
+
+  assert.doesNotMatch(source, /checkRateLimit/);
+  assert.doesNotMatch(source, /getOpsHealthSummary/);
+  assert.doesNotMatch(source, /status:\s*503/);
+  assert.match(source, /ok:\s*true/);
+});
+
 test("public health endpoint does not leak secrets or customer PII", async () => {
   await seedHealthyPricingFreshness();
   await clearOpsHealthNoise();
@@ -2661,9 +3428,9 @@ test("public health endpoint does not leak secrets or customer PII", async () =>
     const now = new Date().toISOString();
     await db.getAdapter().execute(
       `UPDATE orders
-       SET paid_at = ?, fulfilled_at = ?, customer_email_sent_at = ?, admin_email_sent_at = ?
+       SET paid_at = ?, payment_confirmed_at = ?, fulfilled_at = ?, customer_email_sent_at = ?, admin_email_sent_at = ?
        WHERE stripe_checkout_session_id = ?`,
-      [now, now, now, now, "cs_health_pii"],
+      [now, now, now, now, now, "cs_health_pii"],
     );
 
     const route = await import("../src/app/api/health/route");
@@ -2693,7 +3460,7 @@ test("security headers include report-only CSP, HSTS, and no-store sensitive rou
   assert.ok(globalRule.headers.some((header) => header.key === "Strict-Transport-Security"));
   assert.ok(globalRule.headers.some((header) => header.key === "Content-Security-Policy-Report-Only"));
 
-  for (const source of ["/api/admin/:path*", "/api/auth/:path*", "/api/payments/:path*", "/orders/:path*", "/checkout/:path*"]) {
+  for (const source of ["/api/admin/:path*", "/api/auth/:path*", "/api/payments/:path*", "/orders/:path*", "/checkout/success"]) {
     const rule = headerRules.find((candidate) => candidate.source === source);
     assert.ok(rule, `${source} should have an explicit no-store header rule`);
     assert.ok(rule.headers.some((header) => header.key === "Cache-Control" && header.value.includes("no-store")));
@@ -2766,6 +3533,7 @@ test("admin diagnostics require authorization and return operational detail", as
     assert.ok(payload.health);
     assert.ok(payload.pricing);
     assert.ok(payload.payments);
+    assert.ok(Array.isArray((payload.pricing as { buildCheckoutReadiness?: unknown }).buildCheckoutReadiness));
   } finally {
     if (oldToken === undefined) delete process.env.ADMIN_API_TOKEN;
     else process.env.ADMIN_API_TOKEN = oldToken;
@@ -2829,6 +3597,13 @@ test("admin operations service and UI show email repair state without full custo
     "UPDATE orders SET paid_at = ?, fulfilled_at = ?, customer_email_sent_at = ?, admin_email_sent_at = ? WHERE id = ?",
     [now, now, now, now, completeOrderId],
   );
+  await db.recordAdminOrderAction({
+    orderId: retryOrderId,
+    action: "stripe_reconcile",
+    result: "paid_reconciled",
+    message: "Operator reconciled a paid Stripe session and retried missing customer notification.",
+    stripeRequestId: "req_admin_ops_test",
+  });
   const quote = await db.createQuoteRequest({
     customerEmail: "sensitive.quote.customer@example.test",
     customerName: "Sensitive Quote Customer",
@@ -2861,6 +3636,12 @@ test("admin operations service and UI show email repair state without full custo
   assert.match(markup, /Retry missing emails/);
   assert.match(markup, /No email repair available/);
   assert.match(markup, /Pending email retries/);
+  assert.match(markup, /Stuck checkout queue/);
+  assert.match(markup, /Paid notification queue/);
+  assert.match(markup, /Fulfillment queue/);
+  assert.match(markup, /Pricing freshness/);
+  assert.match(markup, /Commerce invariants/);
+  assert.match(markup, /Stripe request req_admin_ops_test/);
   assert.match(markup, /Recent quote requests/);
   assert.doesNotMatch(markup, /admin-ops-customer/);
   assert.doesNotMatch(markup, /sensitive\.quote\.customer@example\.test/);
@@ -3054,6 +3835,17 @@ test("quote status counts appear in diagnostics without quote PII", async () => 
     if (oldToken === undefined) delete process.env.ADMIN_API_TOKEN;
     else process.env.ADMIN_API_TOKEN = oldToken;
   }
+});
+
+test("README stays suitable for public review without private runbook details", () => {
+  const readme = readFileSync(join(process.cwd(), "README.md"), "utf8");
+  assert.match(readme, /Project overview/);
+  assert.match(readme, /Public\/demo scope/);
+  assert.match(readme, /Keep production credentials and operational procedures/);
+  assert.doesNotMatch(readme, /Production launch smoke-test checklist/);
+  assert.doesNotMatch(readme, /curl -i https:\/\/llmlab\.ee/);
+  assert.doesNotMatch(readme, /\/api\/admin\/orders\/reconcile-stripe/);
+  assert.doesNotMatch(readme, /\/api\/admin\/orders\/mark-fulfilled/);
 });
 
 test("pricing freshness endpoint returns unhealthy when today history is missing", async () => {
@@ -3306,6 +4098,72 @@ test("order creation writes direct-item price snapshot with the order", async ()
   assert.ok(snapshot.id > 0);
 });
 
+test("commerce invariant guards reject invalid direct writes", async () => {
+  const userId = await createTestUser("commerce-invariants");
+  const now = new Date().toISOString();
+
+  await assert.rejects(
+    async () => db.getAdapter().execute(
+      `INSERT INTO orders (user_id, profile_build_id, order_item_type, order_item_id, build_name, amount_eur_cents, currency, status, created_at, updated_at)
+       VALUES (?, 0, 'GPU', 1, 'Invalid amount', 0, 'eur', 'PENDING', ?, ?)`,
+      [userId, now, now],
+    ),
+    /amount|CHECK|constraint|invariant/i,
+  );
+
+  await assert.rejects(
+    async () => db.getAdapter().execute(
+      `INSERT INTO orders (user_id, profile_build_id, order_item_type, order_item_id, build_name, amount_eur_cents, currency, status, created_at, updated_at)
+       VALUES (?, 0, 'GPU', 1, 'Invalid currency', 100, 'usd', 'PENDING', ?, ?)`,
+      [userId, now, now],
+    ),
+    /currency|CHECK|constraint|invariant/i,
+  );
+
+  await assert.rejects(
+    async () => db.getAdapter().execute(
+      `INSERT INTO orders (user_id, profile_build_id, order_item_type, order_item_id, build_name, amount_eur_cents, currency, status, created_at, updated_at)
+       VALUES (?, 0, 'MAC_SYSTEM', 1, 'Invalid type', 100, 'eur', 'PENDING', ?, ?)`,
+      [userId, now, now],
+    ),
+    /item_type|CHECK|constraint|invariant/i,
+  );
+
+  await assert.rejects(
+    async () => db.getAdapter().execute(
+      `INSERT INTO orders (user_id, profile_build_id, order_item_type, order_item_id, build_name, amount_eur_cents, currency, status, created_at, updated_at)
+       VALUES (?, 0, 'GPU', 1, 'Paid without timestamps', 100, 'eur', 'PAID', ?, ?)`,
+      [userId, now, now],
+    ),
+    /payment state|CHECK|constraint|invariant/i,
+  );
+
+  await assert.rejects(
+    async () => db.getAdapter().execute(
+      `INSERT INTO quote_requests (customer_email, customer_name, product_type, product_id, product_name, message, status, operator_note, created_at, updated_at)
+       VALUES ('quote@example.test', 'Quote Customer', 'gpu', 1, 'GPU', 'Need a quote please', 'NEW', '', ?, ?)`,
+      [now, now],
+    ),
+    /product_type|CHECK|constraint/i,
+  );
+});
+
+test("order price snapshots are unique per order slot", async () => {
+  const userId = await createTestUser("snapshot-unique");
+  const order = await db.createPendingOrderForCatalogItem({ userId, itemType: "GPU", itemId: 1 });
+  assert.equal(order.ok, true);
+  if (!order.ok) throw new Error("order should be created");
+
+  await assert.rejects(
+    async () => db.getAdapter().execute(
+      `INSERT INTO order_price_snapshots (order_id, slot_key, order_item_type, item_id, item_name, unit_price_eur, price_source, created_at)
+       VALUES (?, 'direct_item', 'GPU', 1, 'Duplicate GPU snapshot', 100, 'test', ?)`,
+      [order.orderId, new Date().toISOString()],
+    ),
+    /UNIQUE|unique|constraint/i,
+  );
+});
+
 test("paid fulfillment sends customer and admin email once across concurrent calls", async () => {
   const nodemailerModule = await import("nodemailer");
   const nodemailer = nodemailerModule.default;
@@ -3352,9 +4210,11 @@ test("paid fulfillment sends customer and admin email once across concurrent cal
 
     assert.equal(order?.status, "PAID");
     assert.ok(order?.paid_at);
-    assert.ok(order?.fulfilled_at);
+    assert.ok(order?.payment_confirmed_at);
+    assert.equal(order?.fulfilled_at, null);
     assert.ok(order?.customer_email_sent_at);
     assert.ok(order?.admin_email_sent_at);
+    assert.equal([first, second].filter((result) => result.paymentConfirmed).length, 1);
     assert.equal([first, second].filter((result) => result.customerEmailSent).length, 1);
     assert.equal([first, second].filter((result) => result.adminEmailSent).length, 1);
     assert.equal([first, second].filter((result) => result.alreadyPaid).length, 1);
@@ -3367,6 +4227,165 @@ test("paid fulfillment sends customer and admin email once across concurrent cal
       else process.env[key] = value;
     }
   }
+});
+
+test("admin Stripe reconciliation marks paid sessions paid without marking physical fulfillment complete", async () => {
+  const { reconcileOrderWithStripeCheckoutSession } = await import("../src/lib/server/order-reconciliation");
+
+  await withMockedPaymentEmailEnv(async (sent) => {
+    const userId = await createTestUser("reconcile-paid");
+    const orderId = await insertCheckoutCreatedOrder({ userId, checkoutSessionId: "cs_reconcile_paid", itemId: 41 });
+    const result = await reconcileOrderWithStripeCheckoutSession({
+      orderId,
+      retrieveCheckoutSession: async () => stripeCheckoutSessionForOrder({
+        orderId,
+        userId,
+        checkoutSessionId: "cs_reconcile_paid",
+        paymentIntent: "pi_reconcile_paid",
+        itemId: 41,
+      }),
+    });
+    const order = await db.getOrderById(orderId);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.action, "paid_reconciled");
+    assert.equal(result.mutated, true);
+    assert.equal(order?.status, "PAID");
+    assert.equal(order?.stripe_payment_intent_id, "pi_reconcile_paid");
+    assert.ok(order?.paid_at);
+    assert.ok(order?.payment_confirmed_at);
+    assert.equal(order?.fulfilled_at, null);
+    assert.equal(sent.length, 2);
+  });
+});
+
+test("admin Stripe reconciliation terminalizes expired unpaid sessions idempotently", async () => {
+  const { reconcileOrderWithStripeCheckoutSession } = await import("../src/lib/server/order-reconciliation");
+  const userId = await createTestUser("reconcile-expired");
+  const orderId = await insertCheckoutCreatedOrder({ userId, checkoutSessionId: "cs_reconcile_expired", itemId: 42 });
+
+  const result = await reconcileOrderWithStripeCheckoutSession({
+    orderId,
+    retrieveCheckoutSession: async () => stripeCheckoutSessionForOrder({
+      orderId,
+      userId,
+      checkoutSessionId: "cs_reconcile_expired",
+      paymentStatus: "unpaid",
+      status: "expired",
+      paymentIntent: null,
+      itemId: 42,
+    }),
+  });
+  const second = await reconcileOrderWithStripeCheckoutSession({
+    orderId,
+    retrieveCheckoutSession: async () => stripeCheckoutSessionForOrder({
+      orderId,
+      userId,
+      checkoutSessionId: "cs_reconcile_expired",
+      paymentStatus: "unpaid",
+      status: "expired",
+      paymentIntent: null,
+      itemId: 42,
+    }),
+  });
+  const order = await db.getOrderById(orderId);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, "canceled_reconciled");
+  assert.equal(result.mutated, true);
+  assert.equal(second.ok, true);
+  assert.equal(second.action, "canceled_reconciled");
+  assert.equal(order?.status, "CANCELED");
+});
+
+test("admin Stripe reconciliation leaves already-paid orders paid", async () => {
+  const { reconcileOrderWithStripeCheckoutSession } = await import("../src/lib/server/order-reconciliation");
+  const userId = await createTestUser("reconcile-already-paid");
+  const orderId = await insertCheckoutCreatedOrder({ userId, checkoutSessionId: "cs_reconcile_already_paid", status: "PAID", itemId: 43 });
+  const now = new Date().toISOString();
+  await db.getAdapter().execute(
+    "UPDATE orders SET paid_at = ?, payment_confirmed_at = ?, customer_email_sent_at = ?, admin_email_sent_at = ? WHERE id = ?",
+    [now, now, now, now, orderId],
+  );
+
+  const result = await reconcileOrderWithStripeCheckoutSession({
+    orderId,
+    retrieveCheckoutSession: async () => stripeCheckoutSessionForOrder({
+      orderId,
+      userId,
+      checkoutSessionId: "cs_reconcile_already_paid",
+      paymentIntent: "pi_reconcile_late",
+      itemId: 43,
+    }),
+  });
+  const order = await db.getOrderById(orderId);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, "already_paid");
+  assert.equal(result.mutated, false);
+  assert.equal(order?.status, "PAID");
+  assert.equal(order?.stripe_payment_intent_id, null);
+});
+
+test("admin Stripe reconciliation rejects mismatched amount and missing sessions without mutation", async () => {
+  const { reconcileOrderWithStripeCheckoutSession } = await import("../src/lib/server/order-reconciliation");
+  const userId = await createTestUser("reconcile-guard");
+  const orderId = await insertCheckoutCreatedOrder({ userId, checkoutSessionId: "cs_reconcile_wrong_amount", itemId: 44 });
+
+  const mismatch = await reconcileOrderWithStripeCheckoutSession({
+    orderId,
+    retrieveCheckoutSession: async () => stripeCheckoutSessionForOrder({
+      orderId,
+      userId,
+      checkoutSessionId: "cs_reconcile_wrong_amount",
+      amountTotal: 999,
+      itemId: 44,
+    }),
+  });
+  const afterMismatch = await db.getOrderById(orderId);
+
+  const pending = await db.createPendingOrderForCatalogItem({ userId, itemType: "CPU", itemId: 1 });
+  assert.equal(pending.ok, true);
+  if (!pending.ok) throw new Error("pending order should be created");
+  const missing = await reconcileOrderWithStripeCheckoutSession({
+    orderId: pending.orderId,
+    retrieveCheckoutSession: async () => {
+      throw new Error("should not retrieve without stored session");
+    },
+  });
+
+  assert.equal(mismatch.ok, false);
+  assert.equal(mismatch.action, "validation_failed");
+  assert.deepEqual(mismatch.validationErrors, ["Session amount mismatch."]);
+  assert.equal(afterMismatch?.status, "CHECKOUT_CREATED");
+  assert.equal(missing.ok, false);
+  assert.equal(missing.action, "missing_checkout_session");
+});
+
+test("admin Stripe reconciliation reports ambiguous sessions without mutation", async () => {
+  const { reconcileOrderWithStripeCheckoutSession } = await import("../src/lib/server/order-reconciliation");
+  const userId = await createTestUser("reconcile-ambiguous");
+  const orderId = await insertCheckoutCreatedOrder({ userId, checkoutSessionId: "cs_reconcile_open", itemId: 45 });
+
+  const result = await reconcileOrderWithStripeCheckoutSession({
+    orderId,
+    retrieveCheckoutSession: async () => stripeCheckoutSessionForOrder({
+      orderId,
+      userId,
+      checkoutSessionId: "cs_reconcile_open",
+      paymentStatus: "unpaid",
+      status: "open",
+      paymentIntent: null,
+      itemId: 45,
+    }),
+  });
+  const order = await db.getOrderById(orderId);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, "ambiguous_noop");
+  assert.equal(result.mutated, false);
+  assert.match(result.message, /no order mutation/i);
+  assert.equal(order?.status, "CHECKOUT_CREATED");
 });
 
 test("paid order email rendering tolerates missing optional display fields", async () => {
@@ -3703,6 +4722,11 @@ test("admin paid-email repair requires admin authorization", async () => {
 test("admin repair UI is wired to same-origin session-safe endpoint", async () => {
   const routeSource = readFileSync(join(process.cwd(), "src/app/api/admin/orders/retry-paid-emails/route.ts"), "utf8");
   const buttonSource = readFileSync(join(process.cwd(), "src/components/admin-email-repair-button.tsx"), "utf8");
+  const reconcileRouteSource = readFileSync(join(process.cwd(), "src/app/api/admin/orders/reconcile-stripe/route.ts"), "utf8");
+  const reconcileButtonSource = readFileSync(join(process.cwd(), "src/components/admin-stripe-reconcile-button.tsx"), "utf8");
+  const fulfillRouteSource = readFileSync(join(process.cwd(), "src/app/api/admin/orders/mark-fulfilled/route.ts"), "utf8");
+  const fulfillButtonSource = readFileSync(join(process.cwd(), "src/components/admin-fulfill-order-button.tsx"), "utf8");
+  const operationsSource = readFileSync(join(process.cwd(), "src/components/admin-operations-view.tsx"), "utf8");
 
   assert.match(routeSource, /requireAdminAccess/);
   assert.match(routeSource, /requestOriginIsAllowed/);
@@ -3710,6 +4734,80 @@ test("admin repair UI is wired to same-origin session-safe endpoint", async () =
   assert.match(buttonSource, /\/api\/admin\/orders\/retry-paid-emails/);
   assert.match(buttonSource, /credentials: "same-origin"/);
   assert.match(buttonSource, /Already-sent emails will not be resent/);
+  assert.match(reconcileRouteSource, /requireAdminAccess/);
+  assert.match(reconcileRouteSource, /requestOriginIsAllowed/);
+  assert.match(reconcileButtonSource, /\/api\/admin\/orders\/reconcile-stripe/);
+  assert.match(reconcileButtonSource, /credentials: "same-origin"/);
+  assert.match(fulfillRouteSource, /requireAdminAccess/);
+  assert.match(fulfillRouteSource, /requestOriginIsAllowed/);
+  assert.match(fulfillButtonSource, /\/api\/admin\/orders\/mark-fulfilled/);
+  assert.match(fulfillButtonSource, /does not resend payment emails/);
+  assert.match(operationsSource, /AdminStripeReconcileButton/);
+  assert.match(operationsSource, /AdminFulfillOrderButton/);
+});
+
+test("admin fulfillment action requires payment confirmation and is idempotent", async () => {
+  const oldToken = process.env.ADMIN_API_TOKEN;
+  process.env.ADMIN_API_TOKEN = "fulfill-token";
+
+  try {
+    await withMockedPaymentEmailEnv(async (sent) => {
+      const userId = await createTestUser("fulfill-order");
+      const unpaidOrderId = await insertCheckoutCreatedOrder({
+        userId,
+        checkoutSessionId: "cs_fulfill_unpaid",
+        itemId: 81,
+      });
+      const paidOrderId = await insertCheckoutCreatedOrder({
+        userId,
+        checkoutSessionId: "cs_fulfill_paid",
+        status: "PAID",
+        itemId: 82,
+      });
+      const route = await import("../src/app/api/admin/orders/mark-fulfilled/route");
+      const post = (orderId: number) => route.POST(new Request("https://example.test/api/admin/orders/mark-fulfilled", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer fulfill-token",
+        },
+        body: JSON.stringify({ orderId }),
+      }));
+
+      const unpaid = await post(unpaidOrderId);
+      assert.equal(unpaid.status, 409);
+      assert.equal((await unpaid.json() as { reason: string }).reason, "not_payment_confirmed");
+      assert.equal((await db.getOrderById(unpaidOrderId))?.fulfilled_at, null);
+
+      const first = await post(paidOrderId);
+      assert.equal(first.status, 200);
+      const firstPayload = await first.json() as { fulfilled: boolean; alreadyFulfilled: boolean; fulfilledAt: string };
+      assert.equal(firstPayload.fulfilled, true);
+      assert.equal(firstPayload.alreadyFulfilled, false);
+
+      const second = await post(paidOrderId);
+      assert.equal(second.status, 200);
+      const secondPayload = await second.json() as { fulfilled: boolean; alreadyFulfilled: boolean; fulfilledAt: string };
+      assert.equal(secondPayload.fulfilled, false);
+      assert.equal(secondPayload.alreadyFulfilled, true);
+      assert.equal(secondPayload.fulfilledAt, firstPayload.fulfilledAt);
+
+      const paidOrder = await db.getOrderById(paidOrderId);
+      assert.equal(paidOrder?.fulfilled_at, firstPayload.fulfilledAt);
+      assert.equal(paidOrder?.customer_email_sent_at, null);
+      assert.equal(paidOrder?.admin_email_sent_at, null);
+      assert.equal(sent.length, 0);
+
+      const actions = await db.getAdapter().queryAll<{ action: string; result: string }>(
+        "SELECT action, result FROM admin_order_actions WHERE order_id = ? ORDER BY id ASC",
+        [paidOrderId],
+      );
+      assert.deepEqual(actions.map((action) => action.result), ["fulfilled", "already_fulfilled"]);
+    });
+  } finally {
+    if (oldToken === undefined) delete process.env.ADMIN_API_TOKEN;
+    else process.env.ADMIN_API_TOKEN = oldToken;
+  }
 });
 
 test("admin paid-email repair retries only missing notifications and is repeat-safe", async () => {
@@ -3880,15 +4978,25 @@ test("admin paid-email repair handles nonexistent and already-complete orders sa
 
 test("failed and canceled reconciliation do not regress an already paid order", async () => {
   const userId = await createTestUser("paid-regression");
-  await insertCheckoutCreatedOrder({ userId, checkoutSessionId: "cs_paid_regression", status: "PAID", itemId: 3 });
+  const orderId = await insertCheckoutCreatedOrder({ userId, checkoutSessionId: "cs_paid_regression", status: "PAID", itemId: 3 });
+  const now = new Date().toISOString();
+  await db.getAdapter().execute(
+    "UPDATE orders SET paid_at = ?, payment_confirmed_at = ? WHERE id = ?",
+    [now, now, orderId],
+  );
 
   await db.markOrderFailedFromCheckoutSession({
     checkoutSessionId: "cs_paid_regression",
     paymentIntentId: "pi_failed_late",
   });
   await db.markOrderCanceledFromCheckoutSession("cs_paid_regression");
+  await db.markOrderCheckoutCreationFailed(orderId);
+  await db.setOrderCheckoutSession({ orderId, checkoutSessionId: "cs_paid_overwrite_attempt" });
 
   const order = await db.getOrderByCheckoutSession("cs_paid_regression");
   assert.equal(order?.status, "PAID");
   assert.equal(order?.stripe_payment_intent_id, null);
+  assert.equal(order?.stripe_checkout_session_id, "cs_paid_regression");
+  assert.equal(order?.paid_at, now);
+  assert.equal(order?.payment_confirmed_at, now);
 });

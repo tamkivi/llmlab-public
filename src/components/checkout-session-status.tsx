@@ -139,11 +139,9 @@ export function CheckoutSessionStatus({ sessionId, initialOrder, lang = "en" }: 
         <Link href="/orders" className="btn-primary inline-flex px-3 py-1.5 text-xs">
           {lang === "et" ? "Vaata minu tellimusi" : "View my orders"}
         </Link>
-        {order.status === "PAID" ? null : (
-          <a href={orderSupportHref(order.id)} className="label-pill inline-block">
-            {lang === "et" ? "Võta ühendust" : "Contact support"}
-          </a>
-        )}
+        <a href={orderSupportHref(order.id)} className="label-pill inline-block">
+          {lang === "et" ? "Võta ühendust" : "Contact support"}
+        </a>
       </div>
     </div>
   );

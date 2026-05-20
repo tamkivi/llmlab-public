@@ -17,6 +17,7 @@ type BuildPriceHistorySeries = {
   name: string;
   orderPriceEur: number;
   marketAvgEur: number | null;
+  checkedAt?: string | null;
   ranges: Record<RangeKey, PriceHistoryPoint[]>;
 };
 
@@ -45,9 +46,23 @@ function normalizeRange(points: PriceHistoryPoint[]): PriceHistoryPoint[] {
   const byDate = new Map<string, PriceHistoryPoint>();
   for (const point of points) {
     if (!point.date || !Number.isFinite(point.price) || point.price <= 0) continue;
-    byDate.set(point.date, { date: point.date, price: Number((point.price * ASSEMBLY_MARKUP_MULTIPLIER).toFixed(2)) });
+    byDate.set(point.date, { date: point.date, price: Number(point.price.toFixed(2)) });
   }
   return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function currentMarketReference(item: BuildPriceHistorySeries): number {
+  if (item.marketAvgEur !== null && Number.isFinite(item.marketAvgEur) && item.marketAvgEur > 0) {
+    return item.marketAvgEur;
+  }
+  return Number((item.orderPriceEur / ASSEMBLY_MARKUP_MULTIPLIER).toFixed(2));
+}
+
+function currentMarketPoint(item: BuildPriceHistorySeries): PriceHistoryPoint[] {
+  if (item.marketAvgEur === null || !item.checkedAt || !Number.isFinite(item.marketAvgEur) || item.marketAvgEur <= 0) return [];
+  const date = item.checkedAt.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return [];
+  return normalizeRange([{ date, price: currentMarketReference(item) }]);
 }
 
 function latestAtOrBefore(points: PriceHistoryPoint[], date: string): PriceHistoryPoint | null {
@@ -69,23 +84,29 @@ export function BuildPriceHistoryChart({ series, lang = "en" }: BuildPriceHistor
     ...item,
     color: COLORS[index % COLORS.length],
     historyPoints: normalizeRange(item.ranges[selectedRange] ?? []),
+    currentPoints: currentMarketPoint(item),
   }));
 
-  const dates = Array.from(new Set(historicalSeries.flatMap((item) => item.historyPoints.map((point) => point.date)))).sort();
-  const anyRangeHasData = series.some((item) => item.ranges["7d"].length > 0 || item.ranges["30d"].length > 0 || item.ranges["90d"].length > 0);
-  const hasData = dates.length > 0;
-  const componentSeries = historicalSeries.map((item) => ({
+  const hasHistoricalRangeData = series.some((item) => item.ranges["7d"].length > 0 || item.ranges["30d"].length > 0 || item.ranges["90d"].length > 0);
+  const displaySeries = historicalSeries.map((item) => ({
     ...item,
-    points: item.historyPoints.length > 0
-      ? item.historyPoints
-      : dates.map((date) => ({ date, price: item.orderPriceEur })),
+    displayPoints: item.historyPoints.length > 0 ? item.historyPoints : item.currentPoints,
+  }));
+  const dates = Array.from(new Set(displaySeries.flatMap((item) => item.displayPoints.map((point) => point.date)))).sort();
+  const hasData = dates.length > 0;
+  const usesCurrentOnly = hasData && !hasHistoricalRangeData;
+  const componentSeries = displaySeries.map((item) => ({
+    ...item,
+    points: item.displayPoints.length > 0
+      ? item.displayPoints
+      : dates.map((date) => ({ date, price: currentMarketReference(item) })),
   }));
 
   const totalPoints = dates.map((date) => {
     let price = 0;
     for (const item of componentSeries) {
       const latest = latestAtOrBefore(item.points, date);
-      price += latest?.price ?? item.orderPriceEur;
+      price += latest?.price ?? currentMarketReference(item);
     }
     return { date, price: Number(price.toFixed(2)), componentCount: series.length };
   });
@@ -136,8 +157,8 @@ export function BuildPriceHistoryChart({ series, lang = "en" }: BuildPriceHistor
       </p>
       <p className="mt-2 text-xs text-[color:var(--muted)]">
         {isEt
-          ? "Graafik ilmub pärast seda, kui hinnakontrollid on salvestanud vähemalt ühe komponendi ajalugu."
-          : "The combined chart appears after pricing refreshes have stored history for at least one component."}
+          ? "Graafik ilmub pärast esimest edukat hinnavärskendust, mis salvestab kasutatava komponendi hinna."
+          : "The chart appears after the first successful pricing refresh stores usable component pricing."}
       </p>
     </div>
   );
@@ -147,24 +168,24 @@ export function BuildPriceHistoryChart({ series, lang = "en" }: BuildPriceHistor
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-sm font-semibold">
-            {isEt ? "Kõik komponendid ja komplekti kogusumma" : "All components and build total"}
+            {isEt ? "Kõik komponendid ja turu kogusumma" : "All components and market total"}
           </p>
           <p className="mt-1 text-xs text-[color:var(--muted)]">
             {isEt
-              ? "Komponentide jooned näitavad tellimuse hinnale vastavat ajalugu. Ajaloota komponendid kuvatakse praeguse hinnana."
-              : "Component lines show order-equivalent price history. Components without history are shown at their current price."}
+              ? "Komponentide jooned näitavad Eesti turu keskmist enne kokkupanekut. Ajaloota komponendid kuvatakse praeguse turu viitehinnana."
+              : "Component lines show Estonian market averages before assembly. Components without history are shown at their current market reference."}
           </p>
         </div>
         {latestTotal ? (
           <div className="text-right text-xs text-[color:var(--muted)]">
-            <p>{isEt ? "Viimane komplekti kogusumma" : "Latest build total"}</p>
+            <p>{isEt ? "Viimane turu kogusumma" : "Latest market total"}</p>
             <p className="font-mono text-lg font-semibold text-[color:var(--foreground)]">{fmtEur(latestTotal.price)}</p>
             <p>{latestTotal.componentCount}/{series.length} {isEt ? "komponenti" : "components"}</p>
           </div>
         ) : null}
       </div>
 
-      {anyRangeHasData ? (
+      {hasHistoricalRangeData ? (
         <div className="mb-3 flex gap-1">
           {(["7d", "30d", "90d"] as RangeKey[]).map((key) => (
             <button
@@ -186,10 +207,17 @@ export function BuildPriceHistoryChart({ series, lang = "en" }: BuildPriceHistor
 
       {hasData ? (
         <>
+          {usesCurrentOnly ? (
+            <div className="mb-3 rounded-lg border border-[color:var(--panel-border)] bg-[color:var(--panel)]/60 p-3 text-xs leading-5 text-[color:var(--muted)]">
+              {isEt
+                ? "Hinnalugu algab esimesest edukast hinnavärskendusest. Praegused komponentide hinnad on olemas, kuid trendi jaoks on vaja rohkem päevi."
+                : "Price history begins after the first successful pricing refresh. Current component pricing is available, but more historical data is needed to show a trend."}
+            </div>
+          ) : null}
           <div className="mb-3 flex flex-wrap gap-x-4 gap-y-2 text-xs text-[color:var(--muted)]">
             <span className="inline-flex items-center gap-1">
               <span className="h-0.5 w-5 rounded bg-[color:var(--foreground)]" />
-              <span>{isEt ? "Komplekti kogusumma" : "Build total"}</span>
+              <span>{isEt ? "Turu kogusumma" : "Market total"}</span>
             </span>
             {componentSeries.map((item) => (
               <span key={item.key} className="inline-flex max-w-full items-center gap-1">
@@ -202,7 +230,7 @@ export function BuildPriceHistoryChart({ series, lang = "en" }: BuildPriceHistor
           <svg
             viewBox={`0 0 ${W} ${H}`}
             role="img"
-            aria-label={isEt ? "Komponentide ja komplekti kogusumma hinnagraafik" : "Component and build total price chart"}
+            aria-label={isEt ? "Komponentide turu keskmise hinnagraafik" : "Component market average price chart"}
             className="w-full"
             style={{ height: 290, minHeight: 290 }}
             onMouseLeave={() => setHoveredDate(null)}
@@ -272,7 +300,7 @@ export function BuildPriceHistoryChart({ series, lang = "en" }: BuildPriceHistor
                     {fmtDate(hoveredDate, lang)}
                   </text>
                   <text x={tooltipX + 8} y={tooltipY + 31} fill="var(--foreground)" fontSize={11} fontFamily="monospace">
-                    {isEt ? "Kogusumma" : "Total"}: {fmtEur(hoveredTotal.price)} ({hoveredTotal.componentCount}/{series.length})
+                    {isEt ? "Turu kogusumma" : "Market total"}: {fmtEur(hoveredTotal.price)} ({hoveredTotal.componentCount}/{series.length})
                   </text>
                   {hoveredComponents.slice(0, 7).map(({ item, point }, index) => (
                     <text key={item.key} x={tooltipX + 8} y={tooltipY + 48 + index * rowHeight} fill={item.color} fontSize={10} fontFamily="monospace">

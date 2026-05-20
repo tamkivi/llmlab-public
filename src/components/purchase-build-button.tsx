@@ -21,9 +21,11 @@ type CheckoutUnavailableReason =
   | "quote_only"
   | "out_of_stock"
   | "missing_price"
+  | "missing_trusted_component_pricing"
   | "fallback_pricing"
   | "stale_pricing"
   | "pricing_unhealthy"
+  | "order_limit_exceeded"
   | "item_not_found";
 
 type Props = {
@@ -35,6 +37,7 @@ type Props = {
   lang?: SiteLanguage;
   checkoutAvailable?: boolean;
   checkoutUnavailableReason?: CheckoutUnavailableReason;
+  checkoutMaxOrderEur?: number | null;
 };
 
 const t = (lang: SiteLanguage | undefined, en: string, et: string) => lang === "et" ? et : en;
@@ -54,8 +57,12 @@ function disabledCheckoutHeadline(reason: CheckoutUnavailableReason | undefined,
       return t(lang, "Quote-only because the latest market pricing is stale.", "Pakkumispõhine, sest viimane turuhind on aegunud.");
     case "missing_price":
       return t(lang, "Quote-only because pricing data is incomplete.", "Pakkumispõhine, sest hinnainfo on puudulik.");
+    case "missing_trusted_component_pricing":
+      return t(lang, "Quote-only because component pricing could not be verified.", "Pakkumispõhine, sest komponentide hindu ei saanud kontrollida.");
     case "pricing_unhealthy":
       return t(lang, "Quote-only until pricing passes checkout checks.", "Pakkumispõhine kuni hinnainfo läbib kontrollid.");
+    case "order_limit_exceeded":
+      return t(lang, "Quote-only because the build exceeds the online checkout limit.", "Pakkumispõhine, sest komplekt ületab veebimakse limiidi.");
     case "out_of_stock":
       return t(lang, "Quote-only while availability is confirmed.", "Pakkumispõhine kuni saadavus on kinnitatud.");
     case "quote_only":
@@ -73,6 +80,7 @@ function disabledCheckoutDetail(reason: CheckoutUnavailableReason | undefined, l
     case "fallback_pricing":
     case "stale_pricing":
     case "missing_price":
+    case "missing_trusted_component_pricing":
     case "pricing_unhealthy":
       return t(
         lang,
@@ -91,6 +99,12 @@ function disabledCheckoutDetail(reason: CheckoutUnavailableReason | undefined, l
         "Mac and eGPU systems are reviewed manually before pricing and fulfillment.",
         "Maci ja eGPU süsteemid vaadatakse enne hinna ja täitmise kinnitamist käsitsi üle.",
       );
+    case "order_limit_exceeded":
+      return t(
+        lang,
+        "This order is priced from trusted component data, but the total is above the online payment policy limit.",
+        "Tellimus põhineb kontrollitud komponentide hindadel, kuid summa ületab veebimakse poliitika limiidi.",
+      );
     default:
       return t(
         lang,
@@ -100,10 +114,11 @@ function disabledCheckoutDetail(reason: CheckoutUnavailableReason | undefined, l
   }
 }
 
-export function PurchaseBuildButton({ itemType, itemId, priceEur, buttonLabel, isProfileBuild, lang = "en", checkoutAvailable = true, checkoutUnavailableReason }: Props) {
+export function PurchaseBuildButton({ itemType, itemId, priceEur, buttonLabel, isProfileBuild, lang = "en", checkoutAvailable = true, checkoutUnavailableReason, checkoutMaxOrderEur }: Props) {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [checkoutUrl, setCheckoutUrl] = useState<string | null>(null);
+  const [checkoutOrderPriceEur, setCheckoutOrderPriceEur] = useState<number | null>(null);
   const resumeAttemptedRef = useRef(false);
 
   const isEt = lang === "et";
@@ -143,7 +158,7 @@ export function PurchaseBuildButton({ itemType, itemId, priceEur, buttonLabel, i
         return;
       }
 
-      const data = (await response.json()) as { checkoutUrl?: string };
+      const data = (await response.json()) as { checkoutUrl?: string; orderPriceEur?: number; amountEurCents?: number };
       if (!data.checkoutUrl) {
         if (options?.resumed) clearPendingCheckoutIntent();
         setMessage(t(lang, "Checkout session did not return a redirect URL.", "Maksesessioon ei tagastanud suuna-URL-i."));
@@ -153,6 +168,12 @@ export function PurchaseBuildButton({ itemType, itemId, priceEur, buttonLabel, i
       clearPendingCheckoutIntent();
       if (isProfileBuild) {
         setCheckoutUrl(data.checkoutUrl);
+        const orderPrice = typeof data.orderPriceEur === "number"
+          ? data.orderPriceEur
+          : typeof data.amountEurCents === "number"
+            ? data.amountEurCents / 100
+            : priceEur;
+        setCheckoutOrderPriceEur(orderPrice);
       } else {
         window.location.href = data.checkoutUrl;
       }
@@ -162,7 +183,7 @@ export function PurchaseBuildButton({ itemType, itemId, priceEur, buttonLabel, i
     } finally {
       setLoading(false);
     }
-  }, [isProfileBuild, itemId, itemType, lang]);
+  }, [isProfileBuild, itemId, itemType, lang, priceEur]);
 
   useEffect(() => {
     if (!checkoutAvailable) return;
@@ -214,6 +235,11 @@ export function PurchaseBuildButton({ itemType, itemId, priceEur, buttonLabel, i
         <p className="mt-2 text-xs text-[color:var(--muted)]">
           {disabledCheckoutDetail(checkoutUnavailableReason, lang)}
         </p>
+        {checkoutUnavailableReason === "order_limit_exceeded" && checkoutMaxOrderEur ? (
+          <p className="mt-2 text-xs text-[color:var(--muted)]">
+            {isEt ? "Veebimakse limiit" : "Online checkout limit"}: €{checkoutMaxOrderEur.toLocaleString()}
+          </p>
+        ) : null}
         <PurchaseReassurance lang={lang} mode="quote" compact />
       </div>
     );
@@ -226,7 +252,7 @@ export function PurchaseBuildButton({ itemType, itemId, priceEur, buttonLabel, i
         <div className="mt-3 space-y-1 text-xs text-[color:var(--muted)]">
           <p>
             {isEt ? "Tellimuse hind" : "Order price"}:{" "}
-            <strong className="text-[color:var(--foreground)]">€{priceEur.toLocaleString()}</strong>
+            <strong className="text-[color:var(--foreground)]">€{(checkoutOrderPriceEur ?? priceEur).toLocaleString()}</strong>
           </p>
           <p>
             {isEt
@@ -247,6 +273,7 @@ export function PurchaseBuildButton({ itemType, itemId, priceEur, buttonLabel, i
             onClick={() => {
               clearPendingCheckoutIntent();
               setCheckoutUrl(null);
+              setCheckoutOrderPriceEur(null);
             }}
             className="text-xs text-[color:var(--muted)] underline"
           >

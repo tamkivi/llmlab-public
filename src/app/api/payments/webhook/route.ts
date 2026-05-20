@@ -13,7 +13,7 @@ import { checkRateLimit, clientRateLimitKey } from "@/lib/request-utils";
 import { getCheckoutAvailability } from "@/lib/server/checkout-availability";
 import { fulfillPaidCheckoutSession } from "@/lib/server/payment-fulfillment";
 import { logEvent, requestIdFromHeaders, safeErrorReason } from "@/lib/server/structured-log";
-import { getStripe } from "@/lib/stripe";
+import { getStripe, stripeRequestIdFromError } from "@/lib/stripe";
 
 export const runtime = "nodejs";
 
@@ -201,12 +201,12 @@ export async function POST(request: Request) {
           });
           logEvent({
             level: "info",
-            event: "webhook_duplicate_fulfillment_checked",
+            event: "webhook_duplicate_payment_checked",
             area: "stripe_webhook",
             requestId,
             stripeEventId: event.id,
             orderId: verification.order.id,
-            status: fulfillment.fulfilled ? "fulfilled" : fulfillment.alreadyPaid ? "already_paid" : "not_fulfilled",
+            status: fulfillment.paymentConfirmed ? "payment_confirmed" : fulfillment.alreadyPaid ? "already_paid" : "not_reconciled",
           });
         }
       }
@@ -274,12 +274,12 @@ export async function POST(request: Request) {
       });
       logEvent({
         level: "info",
-        event: "webhook_order_fulfilled",
+        event: "webhook_order_payment_confirmed",
         area: "stripe_webhook",
         requestId,
         stripeEventId: event.id,
         orderId: verification.order.id,
-        status: fulfillment.fulfilled ? "fulfilled" : fulfillment.alreadyPaid ? "already_paid" : "not_fulfilled",
+        status: fulfillment.paymentConfirmed ? "payment_confirmed" : fulfillment.alreadyPaid ? "already_paid" : "not_reconciled",
         durationMs: Date.now() - startedAt,
       });
     }
@@ -386,6 +386,7 @@ export async function POST(request: Request) {
       area: "stripe_webhook",
       requestId,
       stripeEventId: reservedEventId,
+      stripeRequestId: stripeRequestIdFromError(error),
       reason,
       durationMs: Date.now() - startedAt,
     });

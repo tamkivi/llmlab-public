@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { initDb, getAdapter, listEstonianPriceChecks, SEED_VERSION } from "@/lib/db";
+import { commerceInvariantViolations, getCommerceInvariantDiagnostics } from "@/lib/db/invariants";
 import { checkRateLimit } from "@/lib/request-utils";
 import { requireAdminAccess } from "@/lib/server/admin-auth";
 import { ASSEMBLY_MARKUP_MULTIPLIER } from "@/lib/pricing-constants";
@@ -33,6 +34,7 @@ export async function GET(request: Request) {
 
   await initDb();
   const db = getAdapter();
+  const commerceInvariants = await getCommerceInvariantDiagnostics(db).catch(() => null);
 
   const warnings: string[] = [];
   const counters: Record<string, number> = {};
@@ -52,10 +54,16 @@ export async function GET(request: Request) {
     "external_gpu_enclosures", "profile_builds", "mac_egpu_builds",
     "users", "orders", "estonian_price_checks", "price_history",
     "pricing_runs", "pricing_run_failures", "order_price_snapshots", "quote_requests",
-    "runtime_locks", "schema_migrations", "seed_runs",
+    "runtime_locks", "admin_order_actions", "schema_migrations", "seed_runs",
   ];
   const countResults = await Promise.all(allTables.map(async (t) => [t, await count(t)] as const));
   for (const [t, c] of countResults) counters[t] = c;
+  if (commerceInvariants) {
+    const invariantWarnings = commerceInvariantViolations(commerceInvariants);
+    warnings.push(...invariantWarnings.map((warning) => `Commerce invariant violation: ${warning}`));
+  } else {
+    warnings.push("Commerce invariant diagnostics could not run.");
+  }
 
   async function checkFk(table: string, idCol: string, refTable: string, refCol: string): Promise<string[]> {
     try {
@@ -603,6 +611,7 @@ export async function GET(request: Request) {
       type: isPg ? "postgresql" : "sqlite",
       isEphemeral: isEphemeralSqlite,
       isProduction: isVercel,
+      commerceInvariants,
     },
     pricingRuns: {
       latest: latestPricingRun,

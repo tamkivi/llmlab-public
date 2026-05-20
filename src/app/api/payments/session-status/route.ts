@@ -9,7 +9,7 @@ import { checkRateLimit, clientRateLimitKey } from "@/lib/request-utils";
 import { requireAuth } from "@/lib/server/auth-helpers";
 import { fulfillPaidCheckoutSession } from "@/lib/server/payment-fulfillment";
 import { logEvent, requestIdFromHeaders, safeErrorReason } from "@/lib/server/structured-log";
-import { getStripe } from "@/lib/stripe";
+import { getStripe, stripeRequestIdFromError } from "@/lib/stripe";
 
 export const runtime = "nodejs";
 
@@ -53,6 +53,7 @@ export async function GET(request: Request) {
       event: "session_status_reconcile_failed",
       area: "session_status",
       requestId,
+      stripeRequestId: stripeRequestIdFromError(error),
       reason: safeErrorReason(error, "stripe_session_retrieve_failed"),
       orderId: order.id,
       durationMs: Date.now() - startedAt,
@@ -90,10 +91,10 @@ export async function GET(request: Request) {
       area: "session_status",
       requestId,
       orderId: order.id,
-      status: fulfillment.fulfilled ? "fulfilled" : fulfillment.alreadyPaid ? "already_paid" : "not_fulfilled",
+      status: fulfillment.paymentConfirmed ? "payment_confirmed" : fulfillment.alreadyPaid ? "already_paid" : "not_reconciled",
       durationMs: Date.now() - startedAt,
     });
-  } else if (session.status === "expired" && order.status !== "PAID") {
+  } else if (session.status === "expired" && order.status !== "PAID" && !order.paid_at) {
     await markOrderCanceledFromCheckoutSession(session.id);
     logEvent({
       level: "info",
@@ -104,7 +105,7 @@ export async function GET(request: Request) {
       status: "canceled",
       durationMs: Date.now() - startedAt,
     });
-  } else if (session.payment_status === "unpaid" && session.status === "complete" && order.status !== "PAID") {
+  } else if (session.payment_status === "unpaid" && session.status === "complete" && order.status !== "PAID" && !order.paid_at) {
     await markOrderFailedFromCheckoutSession({
       checkoutSessionId: session.id,
       paymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,

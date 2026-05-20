@@ -347,8 +347,10 @@ export type OrderRecord = {
   status: OrderStatus;
   stripe_checkout_session_id: string | null;
   stripe_payment_intent_id: string | null;
+  payment_confirmed_at: string | null;
   paid_at: string | null;
   fulfilled_at: string | null;
+  fulfilled_by_user_id: number | null;
   customer_email_sent_at: string | null;
   admin_email_sent_at: string | null;
   customer_email_send_attempted_at: string | null;
@@ -383,8 +385,10 @@ export type AdminOrderListItem = {
   status: OrderStatus;
   stripe_checkout_session_id: string | null;
   stripe_payment_intent_id: string | null;
+  payment_confirmed_at: string | null;
   paid_at: string | null;
   fulfilled_at: string | null;
+  fulfilled_by_user_id: number | null;
   customer_email_sent_at: string | null;
   admin_email_sent_at: string | null;
   customer_email_send_attempted_at: string | null;
@@ -426,6 +430,17 @@ export type OrderPriceSnapshotRecord = {
   item_name: string;
   unit_price_eur: number;
   price_source: string;
+  created_at: string;
+};
+
+export type AdminOrderActionRecord = {
+  id: number;
+  order_id: number | null;
+  action: "stripe_reconcile" | "mark_fulfilled";
+  actor_user_id: number | null;
+  result: string;
+  message: string;
+  stripe_request_id: string | null;
   created_at: string;
 };
 
